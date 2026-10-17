@@ -92,7 +92,7 @@
 
       <label class="row">칸 개수(가로) <b id="colsV">80</b></label>
       <input type="range" id="cols" min="20" max="1600" value="80">
-      <p class="hint">사진을 넣으면 🪄 알맞게 자동으로 맞춰져요. 많을수록 자세하지만, 바꾸면 직접 고친 칸은 지워져요.</p>
+      <p class="hint">사진을 넣으면 🪄 항상 가장 자세한 1600칸으로 맞춰져요. 바꾸면 직접 고친 칸은 지워져요.</p>
 
       <label class="check"><input type="checkbox" id="shadow" checked> 그림자 보정</label>
       <label class="check"><input type="checkbox" id="thick"> 벽 두껍게 (로봇이 벽을 뚫고 가면 켜요)</label>
@@ -172,6 +172,16 @@ let img = null;            // 처리용 사진 정보 { w, h, gray, fixed, otsuS
 let cols = 0, rows = 0;    // 미로 칸 개수
 let wall = null;           // 칸마다 벽(1)인지 길(0)인지
 let box = null;            // 미로 테두리 네모 { X0, Y0, X1, Y1 }
+let rawWall = null;        // 바깥 막기 전의 벽 지도 (안팎을 알아볼 때 써요)
+let fencedWall = null;     // 바깥까지 막은 벽 지도 (글자 지우기·입구 열기 전) — 표시만 바뀌면 이걸로 빨리 다시 칠해요
+let outside = null;        // 칸마다 미로 바깥(1)인지
+let outsideCore = null;    // 그중 진짜 넓은 바깥 (입구 쪽으로 번진 부분은 뺀 것)
+let seepDist = null;       // 진짜 바깥에서 몇 칸 번져 들어온 칸인지 (입구 자리를 거꾸로 찾을 때 써요)
+let comp = null, compSize = [];  // 미로 안쪽 길 덩어리 번호와 크기
+let cw = 3;                // 보통 길 폭 (칸 수)
+let autoPicked = false;    // 출발·도착을 로봇이 찾았는지 (직접 찍었으면 false)
+let mouths = [];           // 출발·도착으로 고른 입구 자리 (사진 위 비율) — 그 주변 바깥은 막지 않아요
+let erase = [];            // 벽이 아니라 표시(S·E 글자 같은 것)라서 지울 네모들 (사진 위 비율)
 let edits = new Map();     // 사용자가 직접 고친 칸
 let startPt = null, endPt = null;  // 출발·도착 위치 (사진 위 비율 0~1)
 let tool = "start";
@@ -208,12 +218,12 @@ function loadFile(file) {
 
 // 사진을 흑백 숫자(0=검정 ~ 255=흰색)로 바꿔서 기억해요
 function prepareImage(im) {
-  // 큰 사진은 1600점까지 줄이고, 작은 사진은 1200점까지 부드럽게 늘려요 (가는 선을 더 정확히 읽으려고)
-  const big = Math.max(im.width, im.height);
-  const scale = big < 1200 ? 1200 / big : Math.min(1, 1600 / big);
+  // 어떤 사진이든 가로를 1600점으로 맞춰요 → 칸 개수도 항상 1600칸 (가장 자세하게)
+  const scale = 1600 / im.width;
   const w = Math.max(1, Math.round(im.width * scale)), h = Math.max(1, Math.round(im.height * scale));
   const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
-  const cx = cv.getContext("2d");
+  // willReadFrequently: 그래픽 카드 대신 CPU로 그려요. 그래야 어떤 컴퓨터·브라우저에서든 점 색깔이 똑같이 나와서 결과가 같아요
+  const cx = cv.getContext("2d", { willReadFrequently: true });
   cx.imageSmoothingQuality = "high";
   cx.fillStyle = "#fff"; cx.fillRect(0, 0, w, h);   // 투명한 부분은 흰 종이로
   cx.drawImage(im, 0, 0, w, h);
@@ -230,8 +240,8 @@ function prepareImage(im) {
     const m = boxMean(sum, w, h, x - r, y - r, x + r, y + r);
     fixed[y*w + x] = Math.min(255, gray[y*w + x] / (m + 1) * 220);
   }
-  img = { w, h, gray, fixed, otsuPlain: otsu(gray), otsuShadow: otsu(fixed) };
-  startPt = endPt = null; edits.clear();
+  img = { w, h, gray, fixed, rgb: px, otsuPlain: otsu(gray), otsuShadow: otsu(fixed) };
+  startPt = endPt = null; edits.clear(); erase = []; mouths = [];
   setThresholdDefault();
   autoCols();
   $("empty").hidden = true; stack.hidden = false;
@@ -281,27 +291,10 @@ function setThresholdDefault() {
   $("thrV").textContent = $("thr").value;
 }
 
-// 🪄 칸 개수 자동 맞추기: 사진 여기저기를 가로·세로로 훑으며 벽 두께와 길 너비를 재요.
-// 칸이 길 너비의 1/3보다 작아야 길이 막히지 않고, 벽 두께의 2.5배보다 작아야 벽이 사라지지 않아요.
-// 길 너비는 "좁은 쪽 25%" 값을 써요. 좁은 길 하나만 막혀도 미로 전체를 못 푸니까요.
+// 🪄 칸 개수 자동 맞추기: 어떤 사진이든 항상 1600칸 (사진 가로를 1600점으로 맞췄으니 점 하나 = 칸 하나).
+// 칸이 많을수록 가는 선도 끊기지 않고 그림이 깨지지 않아요. 대신 계산이 조금 느려질 수 있어요.
 function autoCols() {
-  const { w, h } = img, vals = $("shadow").checked ? img.fixed : img.gray, thr = +$("thr").value;
-  const darkRuns = [], lightRuns = [];
-  const scan = (len, at) => {          // 한 줄을 따라가며 검은 점·흰 점이 몇 개씩 이어지는지 세기
-    let run = 0, cur = null;
-    for (let k = Math.floor(len * .1); k < len * .9; k++) {
-      const d = vals[at(k)] < thr;
-      if (d === cur) run++;
-      else { if (cur !== null) (cur ? darkRuns : lightRuns).push(run); cur = d; run = 1; }
-    }
-  };
-  for (let y = Math.floor(h * .1); y < h * .9; y += Math.max(1, h / 60 | 0)) scan(w, x => y * w + x);
-  for (let x = Math.floor(w * .1); x < w * .9; x += Math.max(1, w / 60 | 0)) scan(h, y => y * w + x);
-  if (!darkRuns.length || !lightRuns.length) return;
-  const pick = (a, q) => a.sort((p, q) => p - q)[Math.floor(a.length * q)];
-  let cell = Math.max(1, Math.min(pick(darkRuns, .5) * 2.5, pick(lightRuns, .25) / 3));
-  if (cell < 2) cell = 1;   // 1.3점 같은 애매한 칸은 선에 반쯤 걸쳐 선을 두껍게 만들어요 → 점 하나 = 칸 하나로
-  const c = Math.max(20, Math.min(1600, Math.round(w / cell)));
+  const c = 1600;
   $("cols").value = c; $("colsV").textContent = c;
 }
 
@@ -340,8 +333,17 @@ function rebuild() {
       }
     }
   }
+  for (const [i, v] of edits) wall[i] = v;
+  rawWall = wall.slice();
+  analyze();
   box = { X0: 0, Y0: 0, X1: cols - 1, Y1: rows - 1 };
-  if ($("fence").checked) fenceOutside();
+  if ($("fence").checked) {
+    fenceOutside();
+    for (let i = 0; i < wall.length; i++) if (outsideCore[i]) wall[i] = 1;   // 미로 모양 바깥도 막기 (원·피라미드 미로)
+  }
+  fencedWall = wall.slice();
+  applyErase();
+  openMouths();
   for (const [i, v] of edits) wall[i] = v;
 
   // 미로 그림판: 칸 하나 = 점 하나. 화면에서는 늘리거나 줄여서 보여 줘요
@@ -536,46 +538,778 @@ function snapToOpen(p, maxD = 8) {
 }
 const ptOf = i => ({ i, fx: (i % cols + .5) / cols, fy: (((i / cols) | 0) + .5) / rows });
 
-// 🪄 출발·도착 자동 찾기
-// 1) 미로 테두리를 한 바퀴 돌며 벽이 끊긴 곳(입구)을 찾아요. 입구가 딱 2곳이면 = 출발·도착!
-// 2) 입구가 없으면 (테두리가 꽉 막힌 미로) 왼쪽 위 → 오른쪽 아래로 정해요.
-// 3) 입구가 1곳이거나 3곳 넘게 보이면 헷갈리니까, 엉뚱하게 고르지 말고 직접 찍어 달라고 해요.
-function autoEnds() {
-  const { X0, Y0, X1, Y1 } = box, ring = [];
-  for (let x = X0; x <= X1; x++) ring.push(Y0 * cols + x);
-  for (let y = Y0 + 1; y <= Y1; y++) ring.push(y * cols + X1);
-  for (let x = X1 - 1; x >= X0; x--) ring.push(Y1 * cols + x);
-  for (let y = Y1 - 1; y > Y0; y--) ring.push(y * cols + X0);
-  const gaps = [];
-  let runCells = [];
-  for (const i of [...ring, ring[0]]) {
-    if (!wall[i]) runCells.push(i);
-    else if (runCells.length) { gaps.push(runCells[runCells.length >> 1]); runCells = []; }
-  }
-  if (runCells.length) gaps.push(runCells[runCells.length >> 1]);
-
-  if (gaps.length === 2) {
-    const [a, b] = gaps[0] < gaps[1] ? gaps : [gaps[1], gaps[0]];   // 위쪽(먼저 나오는) 입구가 출발
-    startPt = ptOf(a); endPt = ptOf(b);
-    say("🪄 입구 2곳을 찾아서 출발·도착을 정했어요! ▶️ 풀기를 눌러 보세요.");
-  } else if (gaps.length) {
-    startPt = endPt = null;
-    setTool("start"); drawOverlay();
-    say("🤔 입구가 어딘지 헷갈려요. 출발점(S, START 같은 표시)을 직접 클릭해 주세요!");
-    return;
-  } else {
-    const s = ptOf(Y0 * cols + X0), g = ptOf(Y1 * cols + X1);
-    const reach = Math.max(10, Math.round(Math.max(cols, rows) / 10));
-    if (!snapToOpen(s, reach) || !snapToOpen(g, reach)) {
-      startPt = endPt = null; drawOverlay();
-      say("🟢 입구를 못 찾았어요. 출발점을 직접 클릭해 주세요.");
-      return;
+// ───────── 🪄 미로 안팎 알아보기 ─────────
+// 미로 길은 좁고, 미로 바깥은 넓게 텅 비어 있어요. 그래서
+// 1) 사진 가장자리에서 "넓은 빈 땅"을 따라 물감을 퍼뜨려 바깥을 칠하고
+// 2) 바깥에서 길을 따라 조금 더 번지게 해서 좁은 틈(테두리의 자잘한 홈)을 메워요.
+// 3) 칠해지지 않은 길 칸들은 "미로 안쪽"이고, 서로 이어진 덩어리마다 번호를 붙여요.
+function analyze() {
+  const W = rawWall, N = cols * rows;
+  cw = corridorWidth(W);
+  const D = distToWall(W), r = Math.ceil(cw / 2) + 1;
+  // 넓은 땅: 한 변이 (2r+1)칸인 네모가 벽에 안 닿고 쏙 들어가는 곳 + 그 네모가 덮는 칸
+  const wide = new Uint8Array(N), seeds = [];
+  for (let i = 0; i < N; i++) if (D[i] > r) { wide[i] = 1; seeds.push(i); }
+  spread(seeds, wide, r, DIR8);
+  // 사진 가장자리의 길 칸, 그리고 아주 큰 넓은 땅(액자 안쪽의 흰 배경 등)에서 시작해 넓은 땅을 따라 바깥 칠하기
+  outside = new Uint8Array(N);
+  const q = [];
+  const edge = i => { if (!W[i] && !outside[i]) { outside[i] = 1; q.push(i); } };
+  for (let x = 0; x < cols; x++) { edge(x); edge((rows - 1) * cols + x); }
+  for (let y = 0; y < rows; y++) { edge(y * cols); edge(y * cols + cols - 1); }
+  const lab = new Uint8Array(N), bigArea = Math.max((cw * 8) ** 2, N * 0.01);
+  for (let i = 0; i < N; i++) {
+    if (!wide[i] || lab[i]) continue;
+    const part = [i]; lab[i] = 1;
+    for (let h = 0; h < part.length; h++) {
+      const c = part[h], x = c % cols, y = (c / cols) | 0;
+      for (const [dx, dy] of DIR4) {
+        const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+        if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && wide[ni] && !lab[ni]) { lab[ni] = 1; part.push(ni); }
+      }
     }
-    startPt = s; endPt = g;
-    say("🪄 입구가 안 보여서 왼쪽 위 → 오른쪽 아래로 정했어요. ▶️ 풀기를 눌러 보세요! (바꾸려면 직접 찍기)");
+    if (part.length >= bigArea) for (const c of part) edge(c);
   }
+  for (let h = 0; h < q.length; h++) {
+    const c = q[h], x = c % cols, y = (c / cols) | 0;
+    for (const [dx, dy] of DIR4) {
+      const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+      if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && wide[ni] && !outside[ni]) { outside[ni] = 1; q.push(ni); }
+    }
+  }
+  outsideCore = outside.slice();          // 진짜 넓은 바깥 (로봇이 못 나가게 막는 곳은 여기까지만)
+  seepDist = spread(q, outside, cw * 2 + 2, DIR4);   // 좁은 틈 메우기 (입구 길로도 조금 들어가요 — 입구 찾기에만 써요)
+  // 안쪽 길 덩어리 번호 붙이기
+  comp = new Int32Array(N).fill(-1); compSize = [];
+  for (let i = 0; i < N; i++) {
+    if (W[i] || outside[i] || comp[i] >= 0) continue;
+    const id = compSize.length, st = [i]; comp[i] = id; let n = 0;
+    while (st.length) {
+      const c = st.pop(), x = c % cols, y = (c / cols) | 0; n++;
+      for (const [dx, dy] of DIR4) {
+        const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+        if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && !W[ni] && !outside[ni] && comp[ni] < 0) { comp[ni] = id; st.push(ni); }
+      }
+    }
+    compSize.push(n);
+  }
+}
+
+// 길 폭 재기: 양쪽이 벽으로 막힌 "가로·세로 길 칸 줄"의 길이를 모아 가운데값을 써요
+function corridorWidth(W) {
+  const runs = [];
+  const scan = (len, at) => {
+    let run = 0, closed = false;
+    for (let k = 0; k < len; k++) {
+      if (!W[at(k)]) run++;
+      else { if (run && closed) runs.push(run); run = 0; closed = true; }
+    }
+  };
+  for (let y = 0; y < rows; y++) scan(cols, x => y * cols + x);
+  for (let x = 0; x < cols; x++) scan(rows, y => y * cols + x);
+  if (!runs.length) return 3;
+  runs.sort((a, b) => a - b);
+  return Math.max(1, runs[runs.length >> 1]);
+}
+
+// 칸마다 "가장 가까운 벽까지 몇 칸인지" (대각선도 1칸). 사진 밖은 벽이 아니라고 봐요.
+function distToWall(W) {
+  const D = new Int32Array(cols * rows);
+  for (let i = 0; i < D.length; i++) D[i] = W[i] ? 0 : 1e9;
+  const look = (x, y, dx, dy, i) => {
+    const nx = x + dx, ny = y + dy;
+    if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && D[ny * cols + nx] + 1 < D[i]) D[i] = D[ny * cols + nx] + 1;
+  };
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    const i = y * cols + x;
+    if (D[i]) { look(x, y, -1, 0, i); look(x, y, -1, -1, i); look(x, y, 0, -1, i); look(x, y, 1, -1, i); }
+  }
+  for (let y = rows - 1; y >= 0; y--) for (let x = cols - 1; x >= 0; x--) {
+    const i = y * cols + x;
+    if (D[i]) { look(x, y, 1, 0, i); look(x, y, 1, 1, i); look(x, y, 0, 1, i); look(x, y, -1, 1, i); }
+  }
+  return D;
+}
+
+// 표시된 칸(mark=1)에서 길 칸을 따라 depth칸까지 번지게 칠하기
+function spread(seeds, mark, depth, dirs) {
+  const dist = new Int32Array(cols * rows).fill(-1), q = seeds.slice();
+  for (const i of q) dist[i] = 0;
+  for (let h = 0; h < q.length; h++) {
+    const c = q[h], d = dist[c];
+    if (d >= depth) continue;
+    const x = c % cols, y = (c / cols) | 0;
+    for (const [dx, dy] of dirs) {
+      const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows || rawWall[ni] || dist[ni] >= 0) continue;
+      mark[ni] = 1; dist[ni] = d + 1; q.push(ni);
+    }
+  }
+  return dist;
+}
+
+// ───────── 🪄 출발·도착 자동 찾기 ─────────
+// 후보를 넉넉히 모은 다음, 가장 그럴듯한 짝을 골라요.
+//   🚪 입구: 미로 안쪽 길이 바깥과 닿는 곳
+//   🔤 글자: 길 한가운데 혼자 떠 있는 작은 검은 덩어리 (S, E 같은 글자나 그림)
+//   🎨 색깔 점: 초록(출발)·빨강(도착)처럼 눈에 띄는 색 덩어리
+// 짝은 "서로 이어져 있는지(BFS로 같은 덩어리인지)"를 가장 중요하게 봐요.
+// tune = false 이면 슬라이더는 건드리지 않아요 (사용자가 직접 슬라이더를 움직였을 때)
+// 글자 지우기·입구 열기만 바뀌었을 때: 미로를 처음부터 다시 짓지 않고 표시만 다시 칠해요 (훨씬 빨라요)
+function remark() {
+  wall.set(fencedWall);
+  applyErase();
+  openMouths();
+  for (const [i, v] of edits) wall[i] = v;
+  drawGrid();
+}
+
+function autoEnds(tune = true) {
+  const cands = [...findGaps(), ...findLetters(), ...findColors(), ...findPictures()];
+  const picks = choosePair(cands);
+  autoPicked = picks.length > 0;
+  if (!picks.length) {
+    if (erase.length || mouths.length) { erase = []; mouths = []; remark(); }
+    startPt = endPt = null; setTool("start"); drawOverlay();
+    say("🟢 출발·도착을 못 찾았어요. 출발점을 직접 클릭해 주세요.");
+    return;
+  }
+  // 1등 짝부터 차례로 BFS 검사관에게 보여 주고, 실제로 이어진 첫 짝을 써요
+  const ptsOf = p => ({ s: ptOf(p.s), g: ptOf(p.g) });   // (칸 번호는 다시 짓기 전에 사진 위 위치로 바꿔 둬요)
+  let tries = picks.map(p => ({ ...p, ...ptsOf(p) }));
+  if (tries[0].strong) tries = [tries[0]];   // S·E 표시가 확실하면 다른 짝으로 바꾸지 않고 다듬기로 해결해요
+  let pick = null;
+  // 그 짝의 글자 지우기·입구 열기를 미로에 반영해요 (바뀐 게 있을 때만 다시 지어요)
+  const use = p => {
+    const key = JSON.stringify([p.erase, p.mouths || []]);
+    if (key !== JSON.stringify([erase, mouths])) { erase = p.erase; mouths = p.mouths || []; remark(); }
+    startPt = p.s; endPt = p.g;
+  };
+  for (const p of tries) {
+    if (p !== tries[0] && !p.far) continue;   // 다음 후보는 서로 멀리 떨어진 짝만 (바로 붙은 두 점은 출발·도착이 아니에요)
+    use(p);
+    if (linked()) { pick = p; break; }
+  }
+  if (pick && pick !== tries[0]) pick.sure = false;   // 1등이 아니었으면 확신하진 않아요
+  if (!pick) { pick = tries[0]; use(pick); }
+  const tuned = linked() ? "" : tune ? autoTune(pick.corner) : null;
+  // 두 점이 미로 덩어리의 왼쪽 위·오른쪽 아래 구석에 딱 붙어 있고 길이 이어지면 확실해요 (가장 흔한 미로 모양)
+  if (!pick.sure && tuned !== null) {
+    const b = compBox(comp[cellOf(startPt)]);
+    const near = (pt, X, Y) => b && Math.abs(pt.fx * cols - X) <= (b.x1 - b.x0) * 0.06 && Math.abs(pt.fy * rows - Y) <= (b.y1 - b.y0) * 0.06;
+    if (b && near(startPt, b.x0, b.y0) && near(endPt, b.x1, b.y1)) {
+      pick.sure = true;
+      pick.why = "미로의 왼쪽 위·오른쪽 아래 구석이 길로 이어져 있어서";
+    }
+  }
+  if (tuned === null) pick.sure = false;
+  if (tuned) pick.why += ` (길이 끊겨 보여서 ${tuned} 맞췄어요)`;
+  say(pick.sure ? `😎 ${pick.why} 출발·도착을 정했어요! ▶️ 풀기를 눌러 보세요.`
+                : `🤔 ${pick.why} 아마 여기일 거예요. 틀리면 🟢·🔴 버튼으로 직접 찍어 주세요!`);
   setTool("start");
   drawOverlay();
+}
+
+// 출발·도착을 가장 가까운 길 칸으로 옮긴 뒤, BFS로 서로 이어져 있는지 확인해요
+function linked() {
+  const r = Math.max(8, cw * 4), sp = { ...startPt, i: cellOf(startPt) }, gp = { ...endPt, i: cellOf(endPt) };
+  if (!snapToOpen(sp, r) || !snapToOpen(gp, r)) return false;
+  startPt = sp; endPt = gp;
+  const seen = new Uint8Array(cols * rows), q = [sp.i]; seen[sp.i] = 1;
+  for (let h = 0; h < q.length; h++) {
+    const c = q[h], x = c % cols, y = (c / cols) | 0;
+    if (c === gp.i) return true;
+    for (const [dx, dy] of DIR4) {
+      const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+      if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && !wall[ni] && !seen[ni]) { seen[ni] = 1; q.push(ni); }
+    }
+  }
+  return false;
+}
+
+// 🪄 자동 다듬기: 길이 끊겨 보이면 사람이 슬라이더를 돌려 보듯이 "진하기 기준"과 "칸 개수"를
+// 몇 가지 바꿔 보고, 출발·도착이 이어지는 첫 설정을 써요. 하나도 안 되면 원래대로 돌려놔요.
+// 돌려주는 값: 바꾼 내용 글자 / 못 찾으면 null
+function autoTune(darker = false) {
+  const thr0 = +$("thr").value, cols0 = +$("cols").value, S = startPt, E = endPt;
+  const tries = [];
+  // 보통은 칸 개수만 늘려 봐요. 진하기 기준을 낮추면 연한 벽이 사라져서, 원래 못 푸는 미로(신 미로)도 풀려 버리거든요.
+  // 표시 없이 구석으로 정했을 때만(darker) 진하기 기준도 조금 낮춰 봐요.
+  for (const c of [1.5, 2]) {
+    const n = Math.min(1600, img.w, Math.round(cols0 * c));
+    if (n > cols0) tries.push([thr0, n]);
+  }
+  if (darker) for (const t of [0.85, 0.7]) tries.push([Math.max(10, Math.round(thr0 * t)), cols0]);
+  for (const [t, c] of tries) {
+    $("thr").value = t; $("cols").value = c;
+    $("thrV").textContent = t; $("colsV").textContent = c;
+    rebuild();
+    startPt = S; endPt = E;
+    if (linked()) {
+      const what = [t !== thr0 && "진하기 기준을", c !== cols0 && "칸 개수를"].filter(Boolean).join(" ");
+      return what;
+    }
+  }
+  $("thr").value = thr0; $("cols").value = cols0;
+  $("thrV").textContent = thr0; $("colsV").textContent = cols0;
+  rebuild();
+  startPt = S; endPt = E; linked();
+  return null;
+}
+
+const bigComp = c => c >= 0 && compSize[c] >= Math.max(...compSize) * 0.05;
+const center = (x0, y0, x1, y1) => Math.round((y0 + y1) / 2) * cols + Math.round((x0 + x1) / 2);
+
+// 🚪 입구: 바깥과 닿아 있는 안쪽 칸들을 모아, 가까운 것끼리 한 무리로 묶어요
+function findGaps() {
+  const pts = [];
+  for (let i = 0; i < comp.length; i++) {
+    if (comp[i] < 0 || !bigComp(comp[i])) continue;
+    const x = i % cols, y = (i / cols) | 0;
+    for (const [dx, dy] of DIR4) {
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && outside[ny * cols + nx]) { pts.push(i); break; }
+    }
+  }
+  // 바깥이 입구 안쪽으로 조금 번져 들어가서, 입구 하나가 양쪽 두 조각으로 나뉠 수 있어요 → 넉넉한 거리로 하나로 묶어요
+  const groups = cluster(pts, cw * 3 + 3), out = [];
+  for (const g of groups) {
+    const ext = Math.max(g.x1 - g.x0, g.y1 - g.y0) + 1;
+    if (ext > cw * 7 + 8) continue;            // 너무 길게 뚫린 곳은 입구가 아니라 망가진 테두리
+    const i = mouthOf(g.mid);
+    // 거의 같은 자리의 입구가 또 있으면 하나로 쳐요 (같은 틈을 두 번 세지 않게)
+    if (out.some(o => dist2(o.i, i) < (cw * 4) ** 2)) continue;
+    out.push({ kind: "gap", i, role: null, comp: comp[g.mid], w: 2 });
+  }
+  return out;
+}
+
+// 입구 자리 찾기: 바깥이 번져 들어온 길을 거꾸로(번진 칸 수가 줄어드는 쪽으로) 따라가면 진짜 틈이 나와요
+function mouthOf(i) {
+  const step = c => {
+    const x = c % cols, y = (c / cols) | 0;
+    let best = -1;
+    for (const [dx, dy] of DIR4) {
+      const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows || seepDist[ni] <= 0) continue;
+      if (best < 0 || seepDist[ni] < seepDist[best]) best = ni;
+    }
+    return best;
+  };
+  // 단, 미로 테두리 네모(box) 밖으로 나가기 직전에 멈춰요 (아래쪽 글씨까지 내려가지 않게)
+  const inBox = c => { const x = c % cols, y = (c / cols) | 0; return x >= box.X0 && x <= box.X1 && y >= box.Y0 && y <= box.Y1; };
+  let c = step(i), prev = i;
+  if (c < 0 || !inBox(c)) return i;
+  for (let n = step(c); n >= 0 && seepDist[n] < seepDist[c] && inBox(n); n = step(c)) { prev = c; c = n; }
+  // 틈 바로 안쪽에서 멈추니까, 같은 방향으로 길 폭의 절반만큼 더 나가서 틈 한가운데에 찍어요
+  const dx = c % cols - prev % cols, dy = ((c / cols) | 0) - ((prev / cols) | 0);
+  for (let k = 0; k < Math.ceil(cw * 0.6); k++) {
+    const x = c % cols + dx, y = ((c / cols) | 0) + dy, n = y * cols + x;
+    if ((!dx && !dy) || x < 0 || y < 0 || x >= cols || y >= rows || rawWall[n] || !inBox(n)) break;
+    c = n;
+  }
+  return c;
+}
+
+// 가까운 칸끼리(dist칸 이내) 한 무리로 묶기 — 무리마다 테두리 네모와 가운데 칸을 알려 줘요
+function cluster(pts, dist) {
+  const parent = pts.map((_, k) => k), find = k => parent[k] === k ? k : (parent[k] = find(parent[k]));
+  const B = Math.max(1, dist), buckets = new Map();
+  pts.forEach((i, k) => {
+    const x = i % cols, y = (i / cols) | 0, bx = Math.floor(x / B), by = Math.floor(y / B);
+    for (let ox = -1; ox <= 1; ox++) for (let oy = -1; oy <= 1; oy++)
+      for (const j of buckets.get((bx + ox) + "," + (by + oy)) || []) {
+        const p = pts[j];
+        if (Math.abs(p % cols - x) <= dist && Math.abs(((p / cols) | 0) - y) <= dist) parent[find(j)] = find(k);
+      }
+    const key = bx + "," + by;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(k);
+  });
+  const groups = new Map();
+  pts.forEach((i, k) => {
+    const r = find(k), x = i % cols, y = (i / cols) | 0;
+    if (!groups.has(r)) groups.set(r, { cells: [], x0: x, y0: y, x1: x, y1: y, sx: 0, sy: 0 });
+    const g = groups.get(r);
+    g.cells.push(i); g.sx += x; g.sy += y;
+    g.x0 = Math.min(g.x0, x); g.y0 = Math.min(g.y0, y); g.x1 = Math.max(g.x1, x); g.y1 = Math.max(g.y1, y);
+  });
+  for (const g of groups.values()) {   // 무리의 무게중심에 가장 가까운 칸 = 대표 칸
+    const mx = g.sx / g.cells.length, my = g.sy / g.cells.length;
+    let best = Infinity;
+    for (const i of g.cells) { const d = (i % cols - mx) ** 2 + (((i / cols) | 0) - my) ** 2; if (d < best) { best = d; g.mid = i; } }
+  }
+  return [...groups.values()];
+}
+
+// 🔤 글자: 다른 벽과 붙지 않고 길 안에 혼자 떠 있는 작은 검은 덩어리 중에서
+// 모양이 S(출발)·E·F(도착)와 닮은 것을 찾아요. (사진의 점 하나하나를 보고 찾아요)
+function findLetters() {
+  const { w, h } = img, cell = w / cols, cellH = h / rows, cwPx = cw * cell;
+  const vals = $("shadow").checked ? img.fixed : img.gray, thr = +$("thr").value;
+  const minS = Math.max(6, cwPx * 0.3), maxS = cwPx * 3;
+  const best = {}, hints = [], arrows = [];
+  // 화살표 검사용: 어두운 점 누적합 표 (덩어리 둘레에 다른 어두운 점이 없는지 빨리 세려고)
+  const ink = new Float32Array(w * h);
+  for (let p = 0; p < w * h; p++) ink[p] = vals[p] < thr ? 1 : 0;
+  const inkSum = integral(ink, w, h);
+  // ➡️ 화살표: 혼자 떨어져 있고(둘레가 깨끗하고), 한쪽으로 무게가 쏠린(화살촉 쪽이 무거운) 작은 덩어리
+  const arrowOf = (px, x0, y0, bw, bh) => {
+    const size = Math.max(bw, bh), n = px.length, fill = n / (bw * bh);
+    if (fill < 0.15 || fill > 0.6 || bw / bh > 2.5 || bh / bw > 2.5) return null;
+    const pad = Math.max(3, Math.round(size * 0.35));
+    const [around] = boxSum(inkSum, w, h, x0 - pad, y0 - pad, x0 + bw - 1 + pad, y0 + bh - 1 + pad);
+    if (around - n > n * 0.03) return null;   // 옆에 다른 선이 있으면 글씨나 벽 조각이에요
+    let sx = 0, sy = 0;
+    for (const q of px) { sx += q % w; sy += (q / w) | 0; }
+    const dx = (sx / n - (x0 + bw / 2)) / size, dy = (sy / n - (y0 + bh / 2)) / size;
+    if (Math.hypot(dx, dy) < 0.07) return null;   // 어느 쪽도 가리키지 않아요
+    return { dx, dy };
+  };
+  // 두 번 찾아요: 보통 기준으로 한 번, 아주 진한 것만 보는 기준으로 한 번
+  // (굵고 새까만 글자가 회색 벽에 살짝 닿아 있으면, 진한 기준에서만 떨어져 보여요)
+  // 단, 벽이 연한 회색인 사진에서만요. 벽이 새까만 사진은 벽이 잘게 부서져서 가짜 글자가 생겨요.
+  let nDark = 0, nInk = 0;
+  for (const v of vals) { if (v < thr) nDark++; if (v < thr * 0.5) nInk++; }
+  for (const t of nInk < nDark * 0.2 ? [thr, thr * 0.5] : [thr]) {
+  const seen = new Uint8Array(w * h);
+  for (let p = 0; p < w * h; p++) {
+    if (seen[p] || vals[p] >= t) continue;
+    const st = [p], px = []; seen[p] = 1;
+    let x0 = w, y0 = h, x1 = -1, y1 = -1;
+    while (st.length) {
+      const q = st.pop(), x = q % w, y = (q / w) | 0;
+      if (px.length <= maxS * maxS) px.push(q);
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (const [dx, dy] of DIR8) {
+        const nx = x + dx, ny = y + dy, ni = ny * w + nx;
+        if (nx >= 0 && ny >= 0 && nx < w && ny < h && !seen[ni] && vals[ni] < t) { seen[ni] = 1; st.push(ni); }
+      }
+    }
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    if (bh < minS || bh > maxS || bw > maxS || x0 === 0 || y0 === 0 || x1 === w - 1 || y1 === h - 1) continue;
+    // 글자 둘레의 칸들이 미로 안쪽 길이어야 해요 (바깥 제목 글씨나 그림은 빼요)
+    // (글자가 길을 막아서 둘레가 작은 조각으로 나뉘어 있을 수 있어요. 그래서 "바깥이 아닌지"를 주로 봐요)
+    // 바로 옆이 전부 벽이면 한 칸씩 더 넓혀서 둘레를 봐요
+    let ring = 0, out = 0, c0 = -1;
+    for (let pad = 1; pad <= 4 && ring < 4; pad++) {
+      ring = 0; out = 0; c0 = -1;
+      const gx0 = Math.max(0, Math.floor(x0 / cell) - pad), gx1 = Math.min(cols - 1, Math.floor(x1 / cell) + pad);
+      const gy0 = Math.max(0, Math.floor(y0 / cellH) - pad), gy1 = Math.min(rows - 1, Math.floor(y1 / cellH) + pad);
+      for (let y = gy0; y <= gy1; y++) for (let x = gx0; x <= gx1; x++) {
+        if (y !== gy0 && y !== gy1 && x !== gx0 && x !== gx1) continue;
+        const i = y * cols + x;
+        if (rawWall[i]) continue;
+        ring++;
+        if (outside[i]) out++;
+        else if (comp[i] >= 0 && (c0 < 0 || compSize[comp[i]] > compSize[c0])) c0 = comp[i];
+      }
+    }
+    if (!ring) continue;
+    const m = matchGlyph(px, x0, y0, bw, bh);
+    if (m.score < 0.45 && t === thr) {
+      const a = arrowOf(px, x0, y0, bw, bh, t);
+      if (a) {
+        arrows.push({ ...a, out: out >= ring * 0.8, comp: c0,
+          at: Math.min(rows - 1, Math.floor((y0 + y1) / 2 / cellH)) * cols + Math.min(cols - 1, Math.floor((x0 + x1) / 2 / cell)) });
+        continue;
+      }
+    }
+    // 진한 기준에서도 보이면 진짜 글자일 가능성이 커요 (글자는 보통 벽보다 진해요) → 기준을 낮추고 점수를 더 줘요
+    if (m.score < 0.45) continue;
+    if (t < thr) m.score += 0.1;
+    const at = Math.min(rows - 1, Math.floor((y0 + y1) / 2 / cellH)) * cols + Math.min(cols - 1, Math.floor((x0 + x1) / 2 / cell));
+    if (out >= ring * 0.8) { if (m.score >= 0.6) hints.push({ kind: "hint", ch: m.ch, i: at }); continue; }   // 바깥 글씨 (START, FINISH)
+    if (out > ring * 0.2 || c0 < 0) continue;
+    // 미로 테두리 네모 밖의 글씨(아래쪽 저작권 글씨 등)는 표시가 아니에요
+    const ax = at % cols, ay = (at / cols) | 0;
+    if (ax < box.X0 || ax > box.X1 || ay < box.Y0 || ay > box.Y1) continue;
+    const role = m.ch === "S" ? "S" : "E";
+    if (!best[role] || m.score > best[role].score)
+      best[role] = { role, score: m.score, comp: c0, at, x0, y0, x1, y1 };
+  }
+  }
+  // S·E가 짝으로 나오면 조금 덜 닮아도(0.5 이상) 믿고, 하나만 나오면 아주 닮았을 때만(0.7 이상) 믿어요.
+  // 하나만 나왔는데 조금 덜 닮았으면 "약한 글자"로 남겨 둬요 → 반대쪽 입구 이름표가 있을 때만 써요
+  let letters = Object.values(best);
+  if (letters.length === 2 && letters.some(f => f.score < 0.5)) letters = letters.filter(f => f.score >= 0.5);
+  if (letters.length === 1 && letters[0].score < 0.7) letters[0].weak = true;
+  // 화살표가 너무 많으면 화살표가 아니라 무늬예요
+  const arrowCands = [];
+  if (arrows.length <= 3) {
+    const mx = (box.X0 + box.X1) / 2, my = (box.Y0 + box.Y1) / 2;
+    for (const a of arrows) {
+      const near = nearestInside(a.at, cw * 6);
+      if (near.comp < 0) continue;
+      // 바깥 화살표는 미로 가운데 쪽을 가리키면 출발, 바깥쪽을 가리키면 도착
+      const role = a.out ? ((mx - a.at % cols) * a.dx + (my - ((a.at / cols) | 0)) * a.dy > 0 ? "S" : "E") : null;
+      arrowCands.push({ kind: "arrow", i: near.i, at: a.at, comp: near.comp, w: 3, role, out: a.out, dx: a.dx, dy: a.dy });
+    }
+    // 바깥 화살표들이 모두 같은 쪽을 가리키면(원숭이 미로의 ▼ 두 개) 방향으로는 출발·도착을 못 가려요 → 이름표 없이 표시로만
+    const outs = arrowCands.filter(a => a.out);
+    const len = a => Math.hypot(a.dx, a.dy);
+    if (outs.length >= 2 && outs.every(a => (a.dx * outs[0].dx + a.dy * outs[0].dy) / (len(a) * len(outs[0])) > 0.7))
+      for (const a of outs) a.role = null;
+  }
+  return [...hints, ...arrowCands, ...letters.map(f => ({
+    kind: "letter", role: f.role, comp: f.comp, w: f.weak ? 1 : 3, i: f.at, weak: f.weak,
+    erase: { fx0: f.x0 / w, fy0: f.y0 / h, fx1: (f.x1 + 1) / w, fy1: (f.y1 + 1) / h }
+  }))];
+}
+
+// 글자 견본 만들기: S·E·F를 여러 글꼴로 그려서 G×G 바둑판으로 줄여 둬요
+const G = 10;
+let GLYPHS = null;
+function shrink(px, x0, y0, bw, bh, stride) {
+  const grid = new Float32Array(G * G), cnt = new Float32Array(G * G);
+  for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) cnt[Math.floor(y / bh * G) * G + Math.floor(x / bw * G)]++;
+  for (const q of px) {
+    const x = q % stride - x0, y = ((q / stride) | 0) - y0;
+    grid[Math.floor(y / bh * G) * G + Math.floor(x / bw * G)]++;
+  }
+  for (let k = 0; k < G * G; k++) grid[k] = cnt[k] ? grid[k] / cnt[k] : 0;
+  return grid;
+}
+function glyphs() {
+  if (GLYPHS) return GLYPHS;
+  GLYPHS = [];
+  const S = 80, cv = document.createElement("canvas"); cv.width = cv.height = S;
+  const cx = cv.getContext("2d", { willReadFrequently: true });
+  for (const ch of "SEF") for (const font of ["bold 60px sans-serif", "60px sans-serif", "bold 60px serif", "60px serif"]) {
+    cx.fillStyle = "#fff"; cx.fillRect(0, 0, S, S);
+    cx.fillStyle = "#000"; cx.font = font; cx.textAlign = "center"; cx.textBaseline = "middle"; cx.fillText(ch, S / 2, S / 2);
+    const d = cx.getImageData(0, 0, S, S).data, px = [];
+    let x0 = S, y0 = S, x1 = -1, y1 = -1;
+    for (let q = 0; q < S * S; q++) if (d[q * 4] < 128) {
+      px.push(q); const x = q % S, y = (q / S) | 0;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    GLYPHS.push({ ch, aspect: (x1 - x0 + 1) / (y1 - y0 + 1), grid: shrink(px, x0, y0, x1 - x0 + 1, y1 - y0 + 1, S) });
+  }
+  return GLYPHS;
+}
+// 덩어리와 견본이 얼마나 닮았는지 (1 = 똑같음, 0 = 상관없음)
+function matchGlyph(px, x0, y0, bw, bh) {
+  const a = shrink(px, x0, y0, bw, bh, img.w), aspect = bw / bh;
+  let best = { ch: null, score: 0 };
+  for (const g of glyphs()) {
+    if (aspect / g.aspect > 1.6 || g.aspect / aspect > 1.6) continue;
+    const s = correlate(a, g.grid);
+    if (s > best.score) best = { ch: g.ch, score: s };
+  }
+  return best;
+}
+function correlate(a, b) {
+  let ma = 0, mb = 0;
+  for (let k = 0; k < a.length; k++) { ma += a[k]; mb += b[k]; }
+  ma /= a.length; mb /= b.length;
+  let ab = 0, aa = 0, bb = 0;
+  for (let k = 0; k < a.length; k++) { const da = a[k] - ma, db = b[k] - mb; ab += da * db; aa += da * da; bb += db * db; }
+  return aa && bb ? ab / Math.sqrt(aa * bb) : 0;
+}
+
+// 🎨 색깔 점: 사진에서 진한 색 덩어리를 찾아 초록 = 출발, 빨강 = 도착으로 봐요.
+// 같은 색 덩어리가 너무 많으면(색깔 벽, 풀 장식) 표시가 아니니 빼요.
+// 연한 색 덩어리는 S·E·F 글자 모양일 때만 믿어요 (연한 초록 S 같은 것. 사진 얼룩은 글자 모양이 아니니까요)
+function findColors() {
+  const { w, h, rgb } = img, cell = w / cols, cwPx = cw * cell;
+  const color = new Uint8Array(w * h);   // 0 = 색 없음, 1 = 빨강, 2 = 초록 (+4 = 진한 색)
+  for (let p = 0; p < w * h; p++) {
+    const R = rgb[p * 4], G = rgb[p * 4 + 1], B = rgb[p * 4 + 2];
+    const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
+    if (mx - mn < 30) continue;
+    const strong = mx - mn >= 90 && mx >= 100;
+    // 빨강: 초록·파랑이 둘 다 비슷하게 적어야 해요 (주황 그림자는 초록이 파랑보다 훨씬 많아서 빼요)
+    if (R === mx && G < R * (strong ? 0.55 : 0.85) && B < R * (strong ? 0.55 : 0.85) && Math.abs(G - B) < 45) color[p] = 1;
+    else if (G === mx && R < G * (strong ? 0.8 : 0.92) && B < G * (strong ? 0.8 : 0.92)) color[p] = 2;
+    if (color[p] && strong) color[p] += 4;
+  }
+  const blobs = { 1: [], 2: [] }, pale = { 1: [], 2: [] }, seen = new Uint8Array(w * h);
+  for (let p = 0; p < w * h; p++) {
+    if (!color[p] || seen[p]) continue;
+    const c0 = color[p] & 3, st = [p]; seen[p] = 1;
+    let n = 0, nStrong = 0, x0 = w, y0 = h, x1 = -1, y1 = -1;
+    while (st.length) {
+      const q = st.pop(), x = q % w, y = (q / w) | 0; n++;
+      if (color[q] & 4) nStrong++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (const [dx, dy] of DIR8) {
+        const nx = x + dx, ny = y + dy, ni = ny * w + nx;
+        if (nx >= 0 && ny >= 0 && nx < w && ny < h && (color[ni] & 3) === c0 && !seen[ni]) { seen[ni] = 1; st.push(ni); }
+      }
+    }
+    const big = Math.max(x1 - x0, y1 - y0) + 1, minN = Math.max(6, (cwPx * 0.3) ** 2);
+    if (n < minN || big > cwPx * 8) continue;
+    (nStrong >= minN ? blobs : pale)[c0].push({ x0, y0, x1, y1, n });
+  }
+  // 진한 색 표시가 없고, 연한 초록·연한 빨강이 딱 하나씩 있으면 그 짝을 믿어요
+  if (!blobs[1].length && !blobs[2].length && pale[1].length === 1 && pale[2].length === 1) { blobs[1] = pale[1]; blobs[2] = pale[2]; }
+  // 사진에 많이 쓰인 색(빨간 벽, 초록 벽)은 표시가 아니에요
+  const total = { 1: 0, 2: 0 };
+  for (let p = 0; p < w * h; p++) if (color[p]) total[color[p] & 3]++;
+  // 미로 벽 자체가 빨강이나 초록이면(색깔 미로), 그림 속 다른 색 조각(꽃잎 등)도 표시가 아닐 때가 많아서 다 빼요
+  if (total[1] > w * h * 0.02 || total[2] > w * h * 0.02) return [];
+  const out = [];
+  for (const c0 of [1, 2]) {
+    // 미로에서 멀리 떨어진 색 조각(제목 그림 등)은 빼고 세요
+    const marks = [];
+    for (const b of blobs[c0]) {
+      const at = Math.min(rows - 1, Math.floor((b.y0 + b.y1) / 2 / h * rows)) * cols + Math.min(cols - 1, Math.floor((b.x0 + b.x1) / 2 / cell));
+      const near = nearestInside(at, cw * 4);
+      if (near.comp >= 0) marks.push({ kind: "color", i: near.i, comp: near.comp, w: 4, role: c0 === 2 ? "S" : "E", outsideHint: near.out });
+    }
+    if (marks.length <= 2) out.push(...marks);   // 같은 색이 3곳 넘게 있으면 표시가 아니라 무늬예요
+  }
+  return out;
+}
+
+// 🖼️ 그림 표시: 미로 안쪽에 큼직한 컬러 그림(기차, 바닷가 같은 것)이 딱 2개 있으면 그 둘이 출발·도착이에요.
+// 바깥 캐릭터 그림은 안쪽이 아니라서 빠지고, 작은 풀 장식은 크기가 작아서 빠져요.
+function findPictures() {
+  const { w, h, rgb } = img, cell = w / cols, cwPx = cw * cell;
+  const colorful = new Uint8Array(w * h);
+  let total = 0;
+  for (let p = 0; p < w * h; p++) {
+    const R = rgb[p * 4], G = rgb[p * 4 + 1], B = rgb[p * 4 + 2];
+    if (Math.max(R, G, B) - Math.min(R, G, B) >= 60) { colorful[p] = 1; total++; }
+  }
+  if (total > w * h * 0.05) return [];   // 색깔 벽 미로나 알록달록한 배경은 빼요
+  const seen = new Uint8Array(w * h), pics = [];
+  for (let p = 0; p < w * h; p++) {
+    if (!colorful[p] || seen[p]) continue;
+    const st = [p]; seen[p] = 1;
+    let n = 0, x0 = w, y0 = h, x1 = -1, y1 = -1;
+    while (st.length) {
+      const q = st.pop(), x = q % w, y = (q / w) | 0; n++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      // 그림 속 검은 선 때문에 끊기지 않게 2점 거리까지는 이어진 걸로 봐요
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const nx = x + dx, ny = y + dy, ni = ny * w + nx;
+        if (nx >= 0 && ny >= 0 && nx < w && ny < h && colorful[ni] && !seen[ni]) { seen[ni] = 1; st.push(ni); }
+      }
+    }
+    if (n < (cwPx * 1.5) ** 2 || Math.max(x1 - x0, y1 - y0) > cwPx * 10) continue;
+    const at = Math.min(rows - 1, Math.floor((y0 + y1) / 2 / h * rows)) * cols + Math.min(cols - 1, Math.floor((x0 + x1) / 2 / cell));
+    const near = nearestInside(at, cw * 4);
+    if (near.comp >= 0 && !near.out) pics.push({ kind: "pic", i: near.i, comp: near.comp, w: 3, role: null });
+  }
+  return pics.length === 2 ? pics : [];
+}
+
+// 그 칸에서 가장 가까운 "미로 안쪽 길 칸" 찾기. 가장 가까운 길 칸이 바깥이면 out = true
+function nearestInside(at, maxD) {
+  const x0 = at % cols, y0 = (at / cols) | 0;
+  let out = null;
+  for (let d = 0; d <= maxD; d++) {
+    let best = -1, bd = Infinity, nOut = 0, nIn = 0;
+    for (let dy = -d; dy <= d; dy++) for (let dx = -d; dx <= d; dx++) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== d) continue;
+      const x = x0 + dx, y = y0 + dy, i = y * cols + x;
+      if (x < 0 || y < 0 || x >= cols || y >= rows || rawWall[i]) continue;
+      if (outside[i]) nOut++; else nIn++;
+      if (bigComp(comp[i]) && dx * dx + dy * dy < bd) { bd = dx * dx + dy * dy; best = i; }
+    }
+    if (out === null && nOut + nIn) out = nOut > nIn;
+    if (best >= 0) return { i: best, comp: comp[best], out: !!out };
+  }
+  return { i: at, comp: -1, out: true };
+}
+
+// 후보들 중에서 가장 그럴듯한 출발·도착 짝 고르기
+function choosePair(cands) {
+  // 미로 바깥의 색깔 덩어리는 입구 옆 화살표일 수도, 캐릭터 그림(빨간 자동차)일 수도 있어요.
+  // 그래서 출발·도착 이름표는 붙이지 않고, 가장 가까운 입구에 "표시가 있는 입구" 점수만 더 줘요
+  const gaps = cands.filter(c => c.kind === "gap");
+  for (const c of cands.filter(c => c.kind === "color" && c.outsideHint)) {
+    let best = null, bd = (cw * 8) ** 2;
+    for (const g of gaps) { const d = dist2(g.i, c.i); if (d < bd) { bd = d; best = g; } }
+    if (best && !best.marked) { best.marked = true; best.w += 2; }
+  }
+  cands = cands.filter(c => !(c.kind === "color" && c.outsideHint));
+  // 입구 옆 바깥 글씨로 이름표 붙이기: E·F가 있으면(FINISH, END, EXIT) 도착, S만 있으면(START) 출발
+  const near = new Map();
+  for (const t of cands.filter(c => c.kind === "hint")) {
+    let best = null, bd = (cw * 10) ** 2;
+    for (const g of gaps) { const d = dist2(g.i, t.i); if (d < bd) { bd = d; best = g; } }
+    if (best) { if (!near.has(best)) near.set(best, new Set()); near.get(best).add(t.ch); }
+  }
+  for (const [g, chs] of near) { g.role = chs.has("E") || chs.has("F") ? "E" : "S"; g.w = 3; }
+  cands = cands.filter(c => c.kind !== "hint");
+  // 입구 바로 옆 글자(Finish의 F 같은 것)는 따로 찍지 않고, 그 입구에 이름표만 붙여요
+  cands = cands.filter(c => {
+    if (c.kind !== "letter") return true;
+    let best = null, bd = (cw * 8) ** 2;
+    for (const g of gaps) { const d = dist2(g.i, c.i); if (d < bd) { bd = d; best = g; } }
+    if (!best) return true;
+    if (!best.role) {
+      best.role = c.role; best.w = 3;
+      // 점은 글자에서 가장 가까운 미로 안쪽 길 칸으로 (Finish 글씨 바로 옆, 미로 길이 끝나는 곳)
+      // (글자 네모 + 길 폭 절반 안쪽 칸은 빼요. 글자 위에 찍히지 않게)
+      const e = c.erase, pad = cw * 0.6;
+      const onLetter = i => e && i % cols >= e.fx0 * cols - pad && i % cols <= e.fx1 * cols + pad
+        && ((i / cols) | 0) >= e.fy0 * rows - pad && ((i / cols) | 0) <= e.fy1 * rows + pad;
+      let n = -1, nd = (cw * 6) ** 2;
+      const x0 = c.i % cols, y0 = (c.i / cols) | 0, R = cw * 6;
+      for (let y = Math.max(0, y0 - R); y <= Math.min(rows - 1, y0 + R); y++)
+        for (let x = Math.max(0, x0 - R); x <= Math.min(cols - 1, x0 + R); x++) {
+          const i = y * cols + x;
+          if (comp[i] !== best.comp || onLetter(i)) continue;
+          const d = (x - x0) ** 2 + (y - y0) ** 2;
+          if (d < nd) { nd = d; n = i; }
+        }
+      if (n >= 0) best.i = n;
+    }
+    return false;
+  });
+  // 바깥 화살표: 가까운 입구가 있으면 그 입구에 이름표만 붙여요
+  cands = cands.filter(c => {
+    if (c.kind !== "arrow" || !c.out) return true;
+    let best = null, bd = (cw * 8) ** 2;
+    for (const g of gaps) { const d = dist2(g.i, c.at); if (d < bd) { bd = d; best = g; } }
+    if (!best) return true;
+    if (c.role) best.role = c.role;
+    best.w = 4;   // 미로 가운데 쪽을 가리키면 출발, 바깥쪽이면 도착 (findLetters에서 정했어요)
+    return false;
+  });
+  // 한 글자·이름표 없는 화살표 하나만 달랑 있으면 믿지 않아요 (미로 무늬가 글자·화살표처럼 보일 때가 많아요)
+  if (cands.length === 1 && (cands[0].kind === "letter" || (cands[0].kind === "arrow" && !cands[0].role))) cands = [];
+  // 약한 글자는, 반대쪽 이름표가 붙은 입구가 있고 같은 이름표 입구는 없을 때만 써요 (예: 아래 입구 S + 탑 꼭대기 E)
+  cands = cands.filter(c => !c.weak || (gaps.some(g => g.role && g.role !== c.role) && !gaps.some(g => g.role === c.role)));
+  // 색깔 덩어리 하나만 달랑 있으면(꽃·잎 장식일 때가 많아요) 믿지 않아요
+  if (cands.length === 1 && cands[0].kind === "color") cands = [];
+  // 이름표 없는 입구가 하나만 보여도 믿지 않아요 (테두리의 작은 틈일 때가 많아요) → 왼쪽 위 → 오른쪽 아래로
+  if (cands.length === 1 && cands[0].kind === "gap" && !cands[0].role && !cands[0].marked) cands = [];
+  if (!cands.length) {
+    // 아무 표시도 없으면: 미로 덩어리의 왼쪽 위 → 오른쪽 아래 (사진 테두리 줄무늬 말고 진짜 미로 덩어리)
+    // 사진 구석에 가장 가까운 길 칸 (끊겨 보이면 나중에 autoEnds가 진하기를 다듬어 이어 줘요)
+    const a = nearestInside(0, Math.max(cols, rows)), b = nearestInside(cols * rows - 1, Math.max(cols, rows));
+    if (a.comp < 0 || b.comp < 0) return [];
+    const s = a.i, g = b.i;
+    return [{ s, g, sure: false, corner: true, why: "입구가 안 보여서 왼쪽 위 → 오른쪽 아래로 정했어요.", erase: [] }];
+  }
+  if (cands.length === 1) {
+    // 후보가 하나뿐이면, 거기서 가장 멀리 갈 수 있는 칸을 짝으로
+    const a = cands[0], far = farthest(a.i);
+    const pair = a.role === "E" ? [far, a.i] : [a.i, far];
+    return [{ s: pair[0], g: pair[1], sure: false, why: "표시를 하나만 찾아서 가장 먼 곳을 짝으로 골랐어요.", erase: a.erase ? [a.erase] : [] }];
+  }
+  const pairs = [];
+  for (let p = 0; p < cands.length; p++) for (let q = p + 1; q < cands.length; q++) {
+    const a = cands[p], b = cands[q], clash = a.role && a.role === b.role;   // 둘 다 출발(또는 도착) 표시
+    let score = a.w + b.w + (a.role ? 1 : 0) + (b.role ? 1 : 0) - (clash ? 8 : 0);
+    // 글자·색깔로 S와 E가 짝을 이루면 가장 믿을 만해요 (글자가 길을 막아 덩어리가 나뉘어 보여도)
+    if (a.kind !== "gap" && b.kind !== "gap" && a.role && b.role && !clash) score += 30;
+    if (a.comp === b.comp && a.comp >= 0) score += 20;            // 서로 이어져 있으면 큰 점수
+    score += Math.sqrt(dist2(a.i, b.i)) / Math.max(cols, rows);  // 멀리 떨어진 짝일수록 조금 더
+    pairs.push({ a, b, score });
+  }
+  // 점수 높은 순서로 줄 세워서 돌려줘요 (1등이 실제로 안 이어지면 2등, 3등…을 시험해 봐요)
+  pairs.sort((p, q) => q.score - p.score);
+  return pairs.slice(0, 10).map(({ a, b }) => finishPair(a, b, gaps.length === 2 && cands.length === 2));
+}
+
+// 짝 하나를 "누가 출발인지, 확실한지, 왜 골랐는지"가 담긴 답으로 만들기
+function finishPair(a, b, onlyTwoGaps) {
+  // 누가 출발? 이름표가 있으면 그대로, 없으면(또는 둘 다 같은 이름표면)
+  // 두 점이 옆으로 더 떨어져 있으면 왼쪽이, 위아래로 더 떨어져 있으면 위쪽이 출발 (책 읽는 순서)
+  const clash = a.role && a.role === b.role, roled = a.role && b.role && !clash;
+  if (!clash && (a.role === "E" || b.role === "S")) [a, b] = [b, a];
+  else if (clash || (!a.role && !b.role)) {
+    const dx = b.i % cols - a.i % cols, dy = ((b.i / cols) | 0) - ((a.i / cols) | 0);
+    if (Math.abs(dx) > Math.abs(dy) ? dx < 0 : dy < 0) [a, b] = [b, a];
+  }
+  const linked = a.comp === b.comp && a.comp >= 0;
+  // 미로를 만드는 사람은 출발·도착을 멀리 떨어뜨려요. 너무 가까우면 확신하지 않아요
+  const far = dist2(a.i, b.i) >= (box.X1 - box.X0) ** 2 * 0.04 + (box.Y1 - box.Y0) ** 2 * 0.04;
+  const sure = linked && far && (onlyTwoGaps || (roled && a.kind !== "gap" && b.kind !== "gap"));
+  const name = c => ({ gap: "입구", letter: "글자 표시", color: "색깔 표시", pic: "그림 표시", arrow: "화살표" })[c.kind];
+  const why = a.kind === b.kind ? `${name(a)} 2곳을 찾아서` : `${name(a)}와 ${name(b)}를 찾아서`;
+  const strong = roled && a.kind !== "gap" && b.kind !== "gap";   // 글자·색깔로 S·E가 다 나온 짝
+  const mouths = [a, b].filter(c => c.kind === "gap").map(c => ptOf(c.i));
+  return { s: a.i, g: b.i, sure, strong, far, why, erase: [a.erase, b.erase].filter(Boolean), mouths };
+}
+const dist2 = (i, j) => (i % cols - j % cols) ** 2 + (((i / cols) | 0) - ((j / cols) | 0)) ** 2;
+
+// 길 덩어리 하나가 차지한 네모 { x0, y0, x1, y1 }
+function compBox(c) {
+  if (c < 0) return null;
+  const b = { x0: cols, y0: rows, x1: -1, y1: -1 };
+  for (let i = 0; i < comp.length; i++) if (comp[i] === c) {
+    const x = i % cols, y = (i / cols) | 0;
+    if (x < b.x0) b.x0 = x; if (x > b.x1) b.x1 = x; if (y < b.y0) b.y0 = y; if (y > b.y1) b.y1 = y;
+  }
+  return b;
+}
+// 진짜 미로 덩어리: 가장 큰 길 덩어리. 단, 사진 네 가장자리를 다 따라 도는 가는 테두리 줄무늬는 빼요 (3D 미로의 액자)
+const isRing = c => {
+  const b = compBox(c), m = 0.03;
+  const ring = b.x0 < cols * m && b.y0 < rows * m && b.x1 > cols * (1 - m) && b.y1 > rows * (1 - m);
+  return ring && compSize[c] < (b.x1 - b.x0 + 1) * (b.y1 - b.y0 + 1) * 0.15;
+};
+function mainComp() {
+  let best = -1;
+  for (let c = 0; c < compSize.length; c++) {
+    if (!bigComp(c) || (best >= 0 && compSize[c] <= compSize[best]) || isRing(c)) continue;
+    best = c;
+  }
+  return best;
+}
+// 덩어리 c 안에서 (X, Y)에 가장 가까운 칸 (c = -2 이면 테두리 줄무늬가 아닌 모든 큰 덩어리에서)
+function nearestOfComp(c, X, Y) {
+  let ok = null;
+  if (c === -2) { ok = new Set(); for (let k = 0; k < compSize.length; k++) if (bigComp(k) && !isRing(k)) ok.add(k); }
+  let best = -1, bd = Infinity;
+  for (let i = 0; i < comp.length; i++) if (ok ? ok.has(comp[i]) : comp[i] === c) {
+    const d = (i % cols - X) ** 2 + (((i / cols) | 0) - Y) ** 2;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+// 그 칸에서 BFS로 가장 멀리 갈 수 있는 칸
+function farthest(s) {
+  const d = new Int32Array(cols * rows).fill(-1), q = [s]; d[s] = 0;
+  for (let h = 0; h < q.length; h++) {
+    const c = q[h], x = c % cols, y = (c / cols) | 0;
+    for (const [dx, dy] of DIR4) {
+      const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+      if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && !wall[ni] && d[ni] < 0) { d[ni] = d[c] + 1; q.push(ni); }
+    }
+  }
+  return q[q.length - 1];
+}
+
+// 출발·도착 입구 주변의 바깥은 열어 둬요. 움푹 들어간 입구(원숭이 미로)에서는 여러 길이 거기서 시작하거든요.
+// 조금만 열어서, 로봇이 미로 바깥으로 빙 돌아가는 꼼수는 못 써요.
+// 입구 자리에서 시작해서, 원래 벽이 아닌 칸을 따라 r칸 안에서만 번지며 열어요 (끊긴 곳을 열지 않게)
+function openMouths() {
+  if (!$("fence").checked) return;
+  const r = cw * 4 + 4;
+  for (const m of mouths) {
+    const mx = Math.min(cols - 1, Math.floor(m.fx * cols)), my = Math.min(rows - 1, Math.floor(m.fy * rows));
+    const start = my * cols + mx;
+    if (rawWall[start]) continue;
+    const seen = new Set([start]), q = [start];
+    for (let h = 0; h < q.length; h++) {
+      const c = q[h], x = c % cols, y = (c / cols) | 0;
+      wall[c] = 0;
+      for (const [dx, dy] of DIR4) {
+        const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows || Math.abs(nx - mx) > r || Math.abs(ny - my) > r) continue;
+        if (!rawWall[ni] && !seen.has(ni)) { seen.add(ni); q.push(ni); }
+      }
+    }
+  }
+}
+
+// 표시(글자)는 벽이 아니니까, 로봇이 지나갈 수 있게 지워요
+function applyErase() {
+  for (const e of erase) {
+    const x0 = Math.floor(e.fx0 * cols), x1 = Math.ceil(e.fx1 * cols) - 1;
+    const y0 = Math.floor(e.fy0 * rows), y1 = Math.ceil(e.fy1 * rows) - 1;
+    for (let y = Math.max(0, y0); y <= Math.min(rows - 1, y1); y++)
+      for (let x = Math.max(0, x0); x <= Math.min(cols - 1, x1); x++) wall[y * cols + x] = 0;
+  }
 }
 
 // 누르기 → 움직이지 않고 떼면 "클릭"(출발·도착 찍기), 끌면 "옮기기"
@@ -614,6 +1348,7 @@ function placePoint(e) {
   const p = pointer(e);
   if (!snapToOpen(p)) { say("🧱 벽 위에는 찍을 수 없어요. 하얀 길 위를 눌러 주세요!"); return; }
   clearRun();
+  autoPicked = false;   // 직접 찍은 점은 슬라이더를 바꿔도 다시 찾지 않아요
   if (tool === "start") { startPt = p; if (!endPt) { setTool("end"); say("🔴 이제 도착점을 클릭해 주세요."); } else readyMsg(); }
   else { endPt = p; readyMsg(); }
   drawOverlay();
@@ -626,11 +1361,19 @@ function setCell(i, value) {
 function readyMsg() { if (startPt && endPt) say("👍 준비 완료! ▶️ 풀기를 눌러 보세요."); }
 
 // ───────── 슬라이더 ─────────
-$("thr").oninput = () => { $("thrV").textContent = $("thr").value; rebuild(); };
-$("cols").oninput = () => { $("colsV").textContent = $("cols").value; rebuild(); };
-$("shadow").onchange = () => { if (img) { setThresholdDefault(); rebuild(); } };
-$("thick").onchange = rebuild;
-$("fence").onchange = rebuild;
+// 슬라이더를 바꾸면 미로 그림이 달라져서, 로봇이 찾았던 출발·도착이 그림 안(벽 속)에 갇힐 수 있어요.
+// 그래서 로봇이 찾은 점이라면, 슬라이더를 다 움직이고 0.4초 쉬었을 때 새 그림에서 다시 찾아요.
+let refind = null;
+function rebuildAndRefind() {
+  rebuild();
+  clearTimeout(refind);
+  if (autoPicked) refind = setTimeout(() => { if (wall && autoPicked) autoEnds(false); }, 400);
+}
+$("thr").oninput = () => { $("thrV").textContent = $("thr").value; rebuildAndRefind(); };
+$("cols").oninput = () => { $("colsV").textContent = $("cols").value; rebuildAndRefind(); };
+$("shadow").onchange = () => { if (img) { setThresholdDefault(); rebuildAndRefind(); } };
+$("thick").onchange = rebuildAndRefind;
+$("fence").onchange = rebuildAndRefind;
 $("spd").oninput = () => $("spdV").textContent = $("spd").value;
 
 // ───────── ④ BFS로 미로 풀기 ─────────
