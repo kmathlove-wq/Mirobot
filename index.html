@@ -848,22 +848,41 @@ function findLetters() {
   const { w, h } = img, cell = w / cols, cellH = h / rows, cwPx = cw * cell;
   const vals = $("shadow").checked ? img.fixed : img.gray, thr = +$("thr").value;
   const minS = Math.max(6, cwPx * 0.3), maxS = cwPx * 3;
-  const best = {}, hints = [], arrows = [];
+  const best = {}, hints = [];
+  let arrows = [];
   // 화살표 검사용: 어두운 점 누적합 표 (덩어리 둘레에 다른 어두운 점이 없는지 빨리 세려고)
   const ink = new Float32Array(w * h);
   for (let p = 0; p < w * h; p++) ink[p] = vals[p] < thr ? 1 : 0;
   const inkSum = integral(ink, w, h);
   // ➡️ 화살표: 혼자 떨어져 있고(둘레가 깨끗하고), 한쪽으로 무게가 쏠린(화살촉 쪽이 무거운) 작은 덩어리
-  const arrowOf = (px, x0, y0, bw, bh) => {
+  const arrowOf = (px, x0, y0, bw, bh, outside) => {
     const size = Math.max(bw, bh), n = px.length, fill = n / (bw * bh);
     if (fill < 0.15 || fill > 0.6 || bw / bh > 2.5 || bh / bw > 2.5) return null;
     const pad = Math.max(3, Math.round(size * 0.35));
     const [around] = boxSum(inkSum, w, h, x0 - pad, y0 - pad, x0 + bw - 1 + pad, y0 + bh - 1 + pad);
-    if (around - n > n * 0.03) return null;   // 옆에 다른 선이 있으면 글씨나 벽 조각이에요
+    // 옆에 다른 선이 있으면 글씨나 벽 조각이에요 (미로 바깥 화살표는 미로 테두리가 옆에 있을 수 있어서 느슨하게)
+    if (around - n > n * (outside ? 1 : 0.03)) return null;
     let sx = 0, sy = 0;
     for (const q of px) { sx += q % w; sy += (q / w) | 0; }
-    const dx = (sx / n - (x0 + bw / 2)) / size, dy = (sy / n - (y0 + bh / 2)) / size;
-    if (Math.hypot(dx, dy) < 0.07) return null;   // 어느 쪽도 가리키지 않아요
+    let dx = (sx / n - (x0 + bw / 2)) / size, dy = (sy / n - (y0 + bh / 2)) / size;
+    if (Math.hypot(dx, dy) < 0.07) {
+      // 무게로 모르겠으면 "넓이"로: 화살촉 쪽 끝이 꼬리 쪽 끝보다 넓어요
+      const span = (a, b, horiz) => {   // 그 띠 안에서 잉크가 차지한 폭
+        let lo = Infinity, hi = -Infinity;
+        for (const q of px) {
+          const x = q % w - x0, y = ((q / w) | 0) - y0, t = horiz ? x : y;
+          if (t < a || t > b) continue;
+          const s = horiz ? y : x;
+          if (s < lo) lo = s; if (s > hi) hi = s;
+        }
+        return hi >= lo ? hi - lo + 1 : 0;
+      };
+      dx = (span(bw * 0.75, bw, true) - span(0, bw * 0.25, true)) / bh;
+      dy = (span(bh * 0.75, bh, false) - span(0, bh * 0.25, false)) / bw;
+      if (bw > bh * 1.3) dy = 0;        // 가로로 긴 화살표는 좌우만
+      else if (bh > bw * 1.3) dx = 0;   // 세로로 긴 화살표는 위아래만
+      if (Math.hypot(dx, dy) < 0.12) return null;   // 어느 쪽도 가리키지 않아요
+    }
     return { dx, dy };
   };
   // 두 번 찾아요: 보통 기준으로 한 번, 아주 진한 것만 보는 기준으로 한 번
@@ -908,7 +927,7 @@ function findLetters() {
     if (!ring) continue;
     const m = matchGlyph(px, x0, y0, bw, bh);
     if (m.score < 0.45 && t === thr) {
-      const a = arrowOf(px, x0, y0, bw, bh, t);
+      const a = arrowOf(px, x0, y0, bw, bh, out >= ring * 0.8);
       if (a) {
         arrows.push({ ...a, out: out >= ring * 0.8, comp: c0,
           at: Math.min(rows - 1, Math.floor((y0 + y1) / 2 / cellH)) * cols + Math.min(cols - 1, Math.floor((x0 + x1) / 2 / cell)) });
@@ -936,13 +955,26 @@ function findLetters() {
   if (letters.length === 1 && letters[0].score < 0.7) letters[0].weak = true;
   // 화살표가 너무 많으면 화살표가 아니라 무늬예요
   const arrowCands = [];
-  if (arrows.length <= 3) {
-    const mx = (box.X0 + box.X1) / 2, my = (box.Y0 + box.Y1) / 2;
+  {
+    // 미로 안 화살표와 바깥 화살표를 따로 세서, 한쪽이 3개 넘으면 그쪽만 무늬로 보고 버려요
+    // 바깥 화살표는 입구 바로 옆(길 폭 8배 안)에 있는 것만 써요 (제목의 별·글씨 조각은 입구에서 멀어요)
+    const gapsNow = findGaps();
+    arrows = arrows.filter(a => !a.out || gapsNow.some(g => dist2(g.i, a.at) < (cw * 8) ** 2));
+    const nOut = arrows.filter(a => a.out).length, nIn = arrows.length - nOut;
     for (const a of arrows) {
+      if ((a.out ? nOut : nIn) > 3) continue;
+      if (!a.out) continue;   // 미로 안쪽 "화살표"는 벽 조각일 때가 많아서 쓰지 않아요 (어려운 미로6)
       const near = nearestInside(a.at, cw * 6);
       if (near.comp < 0) continue;
-      // 바깥 화살표는 미로 가운데 쪽을 가리키면 출발, 바깥쪽을 가리키면 도착
-      const role = a.out ? ((mx - a.at % cols) * a.dx + (my - ((a.at / cols) | 0)) * a.dy > 0 ? "S" : "E") : null;
+      // 바깥 화살표: 화살촉이 꼬리보다 미로에 가까우면 들어가는 화살표(출발), 멀면 나가는 화살표(도착)
+      let role = null;
+      if (a.out) {
+        const L = Math.hypot(a.dx, a.dy), ux = a.dx / L, uy = a.dy / L, hlf = cw * 1.5;
+        const ax = a.at % cols, ay = (a.at / cols) | 0;
+        const cellAt = (x, y) => Math.min(rows - 1, Math.max(0, Math.round(y))) * cols + Math.min(cols - 1, Math.max(0, Math.round(x)));
+        const dist = i => { const n = nearestInside(i, cw * 10); return n.comp < 0 ? Infinity : dist2(n.i, i); };
+        role = dist(cellAt(ax + ux * hlf, ay + uy * hlf)) < dist(cellAt(ax - ux * hlf, ay - uy * hlf)) ? "S" : "E";
+      }
       arrowCands.push({ kind: "arrow", i: near.i, at: a.at, comp: near.comp, w: 3, role, out: a.out, dx: a.dx, dy: a.dy });
     }
     // 바깥 화살표들이 모두 같은 쪽을 가리키면(원숭이 미로의 ▼ 두 개) 방향으로는 출발·도착을 못 가려요 → 이름표 없이 표시로만
@@ -1161,8 +1193,17 @@ function choosePair(cands) {
     }
     return false;
   });
+  // 바깥 화살표가 출발(들어가는)·도착(나가는) 하나씩 있으면, 입구 대신 화살표 자리를 그대로 써요
+  // (미국 미로처럼 두 입구가 바로 붙어 있으면 입구가 하나로 뭉쳐 보이거든요)
+  const outArrows = cands.filter(c => c.kind === "arrow" && c.out && c.role);
+  const sA = outArrows.filter(c => c.role === "S"), eA = outArrows.filter(c => c.role === "E");
+  if (sA.length === 1 && eA.length === 1 && dist2(sA[0].i, eA[0].i) < (cw * 15) ** 2) {
+    for (const a of [sA[0], eA[0]]) { a.w = 5; a.keep = true; }
+    cands = cands.filter(c => c.kind !== "gap" || (dist2(c.i, sA[0].i) > (cw * 8) ** 2 && dist2(c.i, eA[0].i) > (cw * 8) ** 2));
+  }
   // 바깥 화살표: 가까운 입구가 있으면 그 입구에 이름표만 붙여요
   cands = cands.filter(c => {
+    if (c.keep) return true;
     if (c.kind !== "arrow" || !c.out) return true;
     let best = null, bd = (cw * 8) ** 2;
     for (const g of gaps) { const d = dist2(g.i, c.at); if (d < bd) { bd = d; best = g; } }
@@ -1221,7 +1262,8 @@ function finishPair(a, b, onlyTwoGaps) {
   const linked = a.comp === b.comp && a.comp >= 0;
   // 미로를 만드는 사람은 출발·도착을 멀리 떨어뜨려요. 너무 가까우면 확신하지 않아요
   const far = dist2(a.i, b.i) >= (box.X1 - box.X0) ** 2 * 0.04 + (box.Y1 - box.Y0) ** 2 * 0.04;
-  const sure = linked && far && (onlyTwoGaps || (roled && a.kind !== "gap" && b.kind !== "gap"));
+  // (글자·화살표로 출발·도착이 둘 다 정해지면 가까이 붙어 있어도 확실해요 — 미국 미로)
+  const sure = linked && ((far && onlyTwoGaps) || (roled && a.kind !== "gap" && b.kind !== "gap"));
   const name = c => ({ gap: "입구", letter: "글자 표시", color: "색깔 표시", pic: "그림 표시", arrow: "화살표" })[c.kind];
   const why = a.kind === b.kind ? `${name(a)} 2곳을 찾아서` : `${name(a)}와 ${name(b)}를 찾아서`;
   const strong = roled && a.kind !== "gap" && b.kind !== "gap";   // 글자·색깔로 S·E가 다 나온 짝
@@ -1284,7 +1326,12 @@ function farthest(s) {
 // 입구 자리에서 시작해서, 원래 벽이 아닌 칸을 따라 r칸 안에서만 번지며 열어요 (끊긴 곳을 열지 않게)
 function openMouths() {
   if (!$("fence").checked) return;
-  const r = cw * 4 + 4;
+  let r = cw * 4 + 4;
+  // 두 입구가 가까우면 조금만 열어요. 많이 열면 두 입구 사이 바깥이 이어져서 로봇이 미로 밖으로 돌아가요
+  for (let a = 0; a < mouths.length; a++) for (let b = a + 1; b < mouths.length; b++) {
+    const d = Math.hypot((mouths[a].fx - mouths[b].fx) * cols, (mouths[a].fy - mouths[b].fy) * rows);
+    r = Math.min(r, Math.floor(d / 3));
+  }
   for (const m of mouths) {
     const mx = Math.min(cols - 1, Math.floor(m.fx * cols)), my = Math.min(rows - 1, Math.floor(m.fy * rows));
     const start = my * cols + mx;
@@ -1349,6 +1396,8 @@ function placePoint(e) {
   if (!snapToOpen(p)) { say("🧱 벽 위에는 찍을 수 없어요. 하얀 길 위를 눌러 주세요!"); return; }
   clearRun();
   autoPicked = false;   // 직접 찍은 점은 슬라이더를 바꿔도 다시 찾지 않아요
+  // 직접 찍으면 로봇이 열어 둔 입구·지운 글자를 되돌려요 (안 그러면 열어 둔 바깥으로 로봇이 돌아갈 수 있어요)
+  if (mouths.length || erase.length) { mouths = []; erase = []; remark(); }
   if (tool === "start") { startPt = p; if (!endPt) { setTool("end"); say("🔴 이제 도착점을 클릭해 주세요."); } else readyMsg(); }
   else { endPt = p; readyMsg(); }
   drawOverlay();
