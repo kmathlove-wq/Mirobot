@@ -552,12 +552,15 @@ function analyze() {
   for (let i = 0; i < N; i++) if (D[i] > r) { wide[i] = 1; seeds.push(i); }
   spread(seeds, wide, r, DIR8);
   // 사진 가장자리의 길 칸, 그리고 아주 큰 넓은 땅(액자 안쪽의 흰 배경 등)에서 시작해 넓은 땅을 따라 바깥 칠하기
+  // 단, 미로 무늬가 네모 테두리 안을 꽉 채웠는데 그 안에 큰 넓은 땅이 갇혀 있으면(그림 미로2: 여자아이 얼굴·손·옷),
+  // 그 땅은 바깥으로 치지 않고, 바깥은 테두리의 짧은 틈(입구)으로는 흘러 들어오지 못해요
+  // (테두리 안에 갇힌 큰 땅이 없는 보통 네모 미로는 예전과 똑같이 해요)
   outside = new Uint8Array(N);
   const q = [];
   const edge = i => { if (!W[i] && !outside[i]) { outside[i] = 1; q.push(i); } };
   for (let x = 0; x < cols; x++) { edge(x); edge((rows - 1) * cols + x); }
   for (let y = 0; y < rows; y++) { edge(y * cols); edge(y * cols + cols - 1); }
-  const lab = new Uint8Array(N), bigArea = Math.max((cw * 8) ** 2, N * 0.01);
+  const lab = new Uint8Array(N), bigArea = Math.max((cw * 8) ** 2, N * 0.01), bigParts = [];
   for (let i = 0; i < N; i++) {
     if (!wide[i] || lab[i]) continue;
     const part = [i]; lab[i] = 1;
@@ -568,13 +571,21 @@ function analyze() {
         if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && wide[ni] && !lab[ni]) { lab[ni] = 1; part.push(ni); }
       }
     }
-    if (part.length >= bigArea) for (const c of part) edge(c);
+    if (part.length >= bigArea) bigParts.push(part);
   }
+  let fr = null;
+  if (bigParts.length) {
+    fr = findFrame(W, wide);
+    // 테두리 안쪽(길 폭 2배 들어간 곳)에 쏙 들어가 있는 큰 땅이 하나라도 있어야 테두리 규칙을 써요
+    const o = cw * 2, inner = c => { const x = c % cols, y = (c / cols) | 0; return x > fr.x0 + o && x < fr.x1 - o && y > fr.y0 + o && y < fr.y1 - o; };
+    if (fr && !bigParts.some(p => p.every(inner))) fr = null;
+  }
+  if (!fr) for (const part of bigParts) for (const c of part) edge(c);
   for (let h = 0; h < q.length; h++) {
     const c = q[h], x = c % cols, y = (c / cols) | 0;
     for (const [dx, dy] of DIR4) {
       const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
-      if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && wide[ni] && !outside[ni]) { outside[ni] = 1; q.push(ni); }
+      if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && wide[ni] && !outside[ni] && !(fr && fr.seal[ni])) { outside[ni] = 1; q.push(ni); }
     }
   }
   outsideCore = outside.slice();          // 진짜 넓은 바깥 (로봇이 못 나가게 막는 곳은 여기까지만)
@@ -593,6 +604,72 @@ function analyze() {
     }
     compSize.push(n);
   }
+}
+
+// 🖼️ 꽉 찬 네모 테두리 찾기: 큰 벽 덩어리들을 감싸는 네모가 사진 대부분을 차지하고, 네 변이 거의 다 선으로 이어져 있고,
+// 테두리 바로 안쪽에 넓은 흰 여백이 거의 없으면(미로 무늬가 테두리까지 꽉 참) 그 네모를 돌려줘요. 아니면 null.
+// (학습지 액자처럼 테두리 안쪽에 흰 여백이 빙 둘러 있으면 액자일 뿐이라 null)
+// (테두리는 모서리 입구 때문에 여러 조각으로 끊겨 있을 수 있어서, 가장 큰 덩어리의 20% 넘는 덩어리들을 모두 감싸요 — fenceOutside와 같은 방법)
+function findFrame(W, wide) {
+  const N = cols * rows, group = new Int32Array(N).fill(-1), all = [];
+  for (let i = 0; i < N; i++) {
+    if (!W[i] || group[i] >= 0) continue;
+    const b = { n: 0, x0: cols, y0: rows, x1: -1, y1: -1 }, st = [i];
+    group[i] = i;
+    while (st.length) {
+      const c = st.pop(), x = c % cols, y = (c / cols) | 0;
+      b.n++;
+      if (x < b.x0) b.x0 = x; if (x > b.x1) b.x1 = x; if (y < b.y0) b.y0 = y; if (y > b.y1) b.y1 = y;
+      for (const [dx, dy] of DIR8) {
+        const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+        if (nx >= 0 && ny >= 0 && nx < cols && ny < rows && W[ni] && group[ni] < 0) { group[ni] = i; st.push(ni); }
+      }
+    }
+    all.push(b);
+  }
+  if (!all.length) return null;
+  const biggest = Math.max(...all.map(b => b.n)), best = { x0: cols, y0: rows, x1: -1, y1: -1 };
+  for (const b of all) if (b.n >= biggest * 0.2) {
+    best.x0 = Math.min(best.x0, b.x0); best.x1 = Math.max(best.x1, b.x1);
+    best.y0 = Math.min(best.y0, b.y0); best.y1 = Math.max(best.y1, b.y1);
+  }
+  if ((best.x1 - best.x0) * (best.y1 - best.y0) < N * 0.6) return null;
+  const { x0, y0, x1, y1 } = best, t = Math.max(2, Math.ceil(cw / 2));
+  // 한 변이 선으로 덮인 비율 (변에서 t칸 안쪽까지 벽이 있으면 덮인 걸로)
+  const cover = (len, at) => {
+    let k = 0;
+    for (let s = 0; s < len; s++) for (let d = 0; d <= t; d++) if (W[at(s, d)]) { k++; break; }
+    return k / len;
+  };
+  const w = x1 - x0 + 1, h = y1 - y0 + 1;
+  const sides = [cover(w, (s, d) => (y0 + d) * cols + x0 + s), cover(w, (s, d) => (y1 - d) * cols + x0 + s),
+                 cover(h, (s, d) => (y0 + s) * cols + x0 + d), cover(h, (s, d) => (y0 + s) * cols + x1 - d)];
+  if (sides.some(v => v < 0.85)) return null;
+  // 테두리 안쪽 (길 폭 2배 들어간 줄)이 넓은 흰 땅인 비율
+  const o = cw * 2;
+  let n = 0, wd = 0;
+  for (let x = x0 + o; x <= x1 - o; x++) for (const y of [y0 + o, y1 - o]) { n++; if (wide[y * cols + x]) wd++; }
+  for (let y = y0 + o; y <= y1 - o; y++) for (const x of [x0 + o, x1 - o]) { n++; if (wide[y * cols + x]) wd++; }
+  if (!n || wd / n >= 0.3) return null;
+  // 테두리의 짧은 틈(진짜 입구 크기)은 "막음" 표시를 해 둬요 → 바깥이 그 틈으로 미로 안 넓은 땅까지 흘러 들어오지 않게 (그림 미로2의 오른쪽 아래 출구)
+  // 긴 틈(편맘 미로의 Start·Finish 그림이 들어간 홈)은 그대로 둬서, 홈은 예전처럼 바깥이 돼요
+  best.seal = new Uint8Array(N);
+  const L = cw * 5, band = cw * 2;
+  const sealRuns = (len, at) => {
+    let s0 = -1;
+    for (let s = 0; s <= len; s++) {
+      let open = s < len;
+      if (open) for (let d = 0; d <= t; d++) if (W[at(s, d)]) { open = false; break; }
+      if (open && s0 < 0) s0 = s;
+      if (!open && s0 >= 0) {
+        if (s - s0 <= L) for (let k = s0; k < s; k++) for (let d = 0; d <= band; d++) best.seal[at(k, d)] = 1;
+        s0 = -1;
+      }
+    }
+  };
+  sealRuns(w, (s, d) => (y0 + d) * cols + x0 + s); sealRuns(w, (s, d) => (y1 - d) * cols + x0 + s);
+  sealRuns(h, (s, d) => (y0 + s) * cols + x0 + d); sealRuns(h, (s, d) => (y0 + s) * cols + x1 - d);
+  return best;
 }
 
 // 길 폭 재기: 양쪽이 벽으로 막힌 "가로·세로 길 칸 줄"의 길이를 모아 가운데값을 써요
@@ -695,7 +772,8 @@ function autoEnds(tune = true) {
   const tuned = linked() ? "" : tune ? autoTune(pick.corner) : null;
   // 두 점이 미로 덩어리의 왼쪽 위·오른쪽 아래 구석에 딱 붙어 있고 길이 이어지면 확실해요 (가장 흔한 미로 모양)
   if (!pick.sure && tuned !== null) {
-    const b = compBox(comp[cellOf(startPt)]);
+    // (구석 끝까지 밀어 넣은 점은 바깥이 번져 든 칸이라 덩어리 번호가 없을 수 있어요 → 도착 쪽, 그것도 없으면 가장 큰 미로 덩어리로 봐요)
+    const cs = comp[cellOf(startPt)], ce = comp[cellOf(endPt)], b = compBox(cs >= 0 ? cs : ce >= 0 ? ce : mainComp());
     const near = (pt, X, Y) => b && Math.abs(pt.fx * cols - X) <= (b.x1 - b.x0) * 0.06 && Math.abs(pt.fy * rows - Y) <= (b.y1 - b.y0) * 0.06;
     if (b && near(startPt, b.x0, b.y0) && near(endPt, b.x1, b.y1)) {
       pick.sure = true;
@@ -857,7 +935,8 @@ function findLetters() {
   // ➡️ 화살표: 혼자 떨어져 있고(둘레가 깨끗하고), 한쪽으로 무게가 쏠린(화살촉 쪽이 무거운) 작은 덩어리
   const arrowOf = (px, x0, y0, bw, bh, outside) => {
     const size = Math.max(bw, bh), n = px.length, fill = n / (bw * bh);
-    if (fill < 0.15 || fill > 0.6 || bw / bh > 2.5 || bh / bw > 2.5) return null;
+    // (통통한 화살표는 네모를 60%보다 조금 더 채워요 — 캐릭터 미로)
+    if (fill < 0.15 || fill > 0.7 || bw / bh > 2.5 || bh / bw > 2.5) return null;
     const pad = Math.max(3, Math.round(size * 0.35));
     const [around] = boxSum(inkSum, w, h, x0 - pad, y0 - pad, x0 + bw - 1 + pad, y0 + bh - 1 + pad);
     // 옆에 다른 선이 있으면 글씨나 벽 조각이에요 (미로 바깥 화살표는 미로 테두리가 옆에 있을 수 있어서 느슨하게)
@@ -883,7 +962,41 @@ function findLetters() {
       else if (bh > bw * 1.3) dx = 0;   // 세로로 긴 화살표는 위아래만
       if (Math.hypot(dx, dy) < 0.12) return null;   // 어느 쪽도 가리키지 않아요
     }
-    return { dx, dy };
+    // 정확한 기울기: 화살표 점들이 가장 길게 늘어선 축(긴 축)을 재요. 방향(앞뒤)은 위에서 어림한 쪽을 그대로 써요
+    // (위의 방법은 좌우·위아래로만 어림해서, 비스듬한 화살표의 입구를 빗나갈 수 있어요 — 미국 미로)
+    // 따로 "뾰족한 끝" 방향(tx, ty)도 재 둬요: 촉 끝은 뾰족해서 좁고, 꼬리 끝은 몸통 굵기만큼 평평해요.
+    // 통통한 화살표는 몸통이 더 무거워서 무게로 어림한 방향이 틀릴 수 있거든요 (캐릭터 미로) — 입구에서 먼 화살표에만 써요
+    let tx = dx, ty = dy;
+    {
+      const cx = sx / n, cy = sy / n;
+      let xx = 0, yy = 0, xy = 0;
+      for (const q of px) { const ex = q % w - cx, ey = ((q / w) | 0) - cy; xx += ex * ex; yy += ey * ey; xy += ex * ey; }
+      const tr = xx + yy, det = xx * yy - xy * xy, l1 = tr / 2 + Math.sqrt(Math.max(0, tr * tr / 4 - det)), l2 = tr - l1;
+      if (l1 > l2 * 1.5) {   // 충분히 길쭉할 때만
+        let ex = xy, ey = l1 - xx;
+        if (Math.abs(ex) + Math.abs(ey) < 1e-9) { ex = 1; ey = 0; }
+        const L = Math.hypot(ex, ey); ex /= L; ey /= L;
+        let t0 = Infinity, t1 = -Infinity;
+        for (const q of px) { const t = (q % w - cx) * ex + (((q / w) | 0) - cy) * ey; if (t < t0) t0 = t; if (t > t1) t1 = t; }
+        // 양 끝 12%만 봐요: 화살촉 끝은 뾰족해서 좁고, 꼬리 끝은 몸통 굵기만큼 평평해요
+        const band = (t1 - t0) * 0.12, lo = [Infinity, -Infinity], hi = [Infinity, -Infinity];
+        for (const q of px) {
+          const X = q % w - cx, Y = ((q / w) | 0) - cy, t = X * ex + Y * ey, s = -X * ey + Y * ex;
+          const b = t <= t0 + band ? lo : t >= t1 - band ? hi : null;
+          if (b) { if (s < b[0]) b[0] = s; if (s > b[1]) b[1] = s; }
+        }
+        const wLo = lo[1] - lo[0], wHi = hi[1] - hi[0], m = Math.max(0.12, Math.hypot(dx, dy));
+        const sg = ex * dx + ey * dy >= 0 ? 1 : -1;
+        // 두 끝 폭이 확실히 다르면 좁은 쪽이 화살촉, 비슷하면 위에서 어림한 방향 쪽으로
+        const tg = Math.abs(wHi - wLo) > Math.max(wHi, wLo) * 0.15 ? (wHi < wLo ? 1 : -1) : sg;
+        // 어림한 방향이 긴 축과 크게 어긋나면(60도 넘게) 어림을 믿기 어려워요 → 뾰족한 끝이 확실하면 그쪽으로 (원 미로, 그림 미로2)
+        const tipSure = Math.abs(wHi - wLo) > Math.max(wHi, wLo) * 0.15;
+        if (Math.abs(ex * dx + ey * dy) >= 0.5 * Math.hypot(dx, dy)) { dx = sg * ex * m; dy = sg * ey * m; }
+        else if (tipSure) { dx = tg * ex * m; dy = tg * ey * m; }
+        tx = tg * ex * m; ty = tg * ey * m;
+      }
+    }
+    return { dx, dy, tx, ty, n };
   };
   // 두 번 찾아요: 보통 기준으로 한 번, 아주 진한 것만 보는 기준으로 한 번
   // (굵고 새까만 글자가 회색 벽에 살짝 닿아 있으면, 진한 기준에서만 떨어져 보여요)
@@ -958,12 +1071,15 @@ function findLetters() {
   {
     // 미로 안 화살표와 바깥 화살표를 따로 세서, 한쪽이 3개 넘으면 그쪽만 무늬로 보고 버려요
     // 바깥 화살표는 입구 바로 옆(길 폭 8배 안)에 있는 것만 써요 (제목의 별·글씨 조각은 입구에서 멀어요)
+    // (입구에서 먼 바깥 화살표는 아래에서 따로 봐요 — 입구가 테두리 색에 가려 안 보이는 캐릭터 미로)
     const gapsNow = findGaps();
-    arrows = arrows.filter(a => !a.out || gapsNow.some(g => dist2(g.i, a.at) < (cw * 8) ** 2));
-    const nOut = arrows.filter(a => a.out).length, nIn = arrows.length - nOut;
+    for (const a of arrows) a.byGap = !a.out || gapsNow.some(g => dist2(g.i, a.at) < (cw * 8) ** 2);
+    const nOut = arrows.filter(a => a.out && a.byGap).length, nIn = arrows.filter(a => !a.out).length;
     for (const a of arrows) {
-      if ((a.out ? nOut : nIn) > 3) continue;
+      if (a.byGap && (a.out ? nOut : nIn) > 3) continue;
       if (!a.out) continue;   // 미로 안쪽 "화살표"는 벽 조각일 때가 많아서 쓰지 않아요 (어려운 미로6)
+      if (a.n < (cw / 2) ** 2) continue;   // 길 폭 절반 네모보다 작은 건 글씨 부스러기예요 (그림 미로2 아래 글씨)
+      if (!a.byGap) { a.dx = a.tx; a.dy = a.ty; }   // 입구에서 먼 화살표는 "뾰족한 끝" 방향으로
       const near = nearestInside(a.at, cw * 6);
       if (near.comp < 0) continue;
       // 바깥 화살표: 화살촉이 꼬리보다 미로에 가까우면 들어가는 화살표(출발), 멀면 나가는 화살표(도착)
@@ -975,13 +1091,33 @@ function findLetters() {
         const dist = i => { const n = nearestInside(i, cw * 10); return n.comp < 0 ? Infinity : dist2(n.i, i); };
         role = dist(cellAt(ax + ux * hlf, ay + uy * hlf)) < dist(cellAt(ax - ux * hlf, ay - uy * hlf)) ? "S" : "E";
       }
-      arrowCands.push({ kind: "arrow", i: near.i, at: a.at, comp: near.comp, w: 3, role, out: a.out, dx: a.dx, dy: a.dy });
+      arrowCands.push({ kind: "arrow", i: near.i, at: a.at, comp: near.comp, w: 3, role, out: a.out, dx: a.dx, dy: a.dy, byGap: a.byGap, n: a.n });
+    }
+    // 입구에서 먼 바깥 화살표는, 들어가는(출발)·나가는(도착) 화살표에서 가장 큰 것 하나씩만 써요
+    // (글씨 조각도 화살표처럼 보일 수 있지만 진짜 화살표보다 작아요 → 길 폭 네모 2개보다 커야 해요)
+    // 입구 옆에 화살표 비슷한 것(글씨 조각 포함)이 하나라도 있으면 안 써요.
+    // 둘의 크기가 많이 다르거나, 미로 크기의 1/4보다 가까우면 믿지 않아요 (같은 그림 속 무늬일 때가 많아요)
+    {
+      const far = arrowCands.filter(a => !a.byGap && a.n >= 2 * cw * cw), big = r => far.filter(a => a.role === r).sort((a, b) => b.n - a.n)[0];
+      const S = big("S"), E = big("E");
+      const ok = !arrows.some(a => a.out && a.byGap) && S && E && Math.max(S.n, E.n) <= Math.min(S.n, E.n) * 1.5
+        && dist2(S.at, E.at) >= ((box.X1 - box.X0) ** 2 + (box.Y1 - box.Y0) ** 2) / 16;
+      for (const a of arrowCands.filter(a => !a.byGap)) if (!ok || (a !== S && a !== E)) arrowCands.splice(arrowCands.indexOf(a), 1);
     }
     // 바깥 화살표들이 모두 같은 쪽을 가리키면(원숭이 미로의 ▼ 두 개) 방향으로는 출발·도착을 못 가려요 → 이름표 없이 표시로만
     const outs = arrowCands.filter(a => a.out);
     const len = a => Math.hypot(a.dx, a.dy);
     if (outs.length >= 2 && outs.every(a => (a.dx * outs[0].dx + a.dy * outs[0].dy) / (len(a) * len(outs[0])) > 0.7))
       for (const a of outs) a.role = null;
+    // 출발·도착이 정해진 화살표는, 가리키는 방향으로 선을 쭉 그어서 그 선이 미로에 닿는 입구 자리에 점을 찍어요
+    // (출발 화살표는 화살촉 쪽으로, 도착 화살표는 꼬리 쪽으로) — 미국 미로처럼 화살표 "근처"가 아니라 정확히 입구에
+    // (입구 옆이 아닌 화살표는 입구가 가려져 있을 수 있어서, 막힌 테두리를 뚫을 자리(erase)도 함께 받아요)
+    for (const a of outs) if (a.role) {
+      const carve = a.byGap ? null : [];
+      const e = arrowEntry(a, carve);
+      if (e >= 0) { a.i = e; a.comp = comp[e] >= 0 ? comp[e] : a.comp; }
+      if (carve && carve.length) a.erase = carve;
+    }
   }
   return [...hints, ...arrowCands, ...letters.map(f => ({
     kind: "letter", role: f.role, comp: f.comp, w: f.weak ? 1 : 3, i: f.at, weak: f.weak,
@@ -1079,19 +1215,48 @@ function findColors() {
   // 사진에 많이 쓰인 색(빨간 벽, 초록 벽)은 표시가 아니에요
   const total = { 1: 0, 2: 0 };
   for (let p = 0; p < w * h; p++) if (color[p]) total[color[p] & 3]++;
-  // 미로 벽 자체가 빨강이나 초록이면(색깔 미로), 그림 속 다른 색 조각(꽃잎 등)도 표시가 아닐 때가 많아서 다 빼요
-  if (total[1] > w * h * 0.02 || total[2] > w * h * 0.02) return [];
-  const out = [];
-  for (const c0 of [1, 2]) {
-    // 미로에서 멀리 떨어진 색 조각(제목 그림 등)은 빼고 세요
-    const marks = [];
-    for (const b of blobs[c0]) {
-      const at = Math.min(rows - 1, Math.floor((b.y0 + b.y1) / 2 / h * rows)) * cols + Math.min(cols - 1, Math.floor((b.x0 + b.x1) / 2 / cell));
-      const near = nearestInside(at, cw * 4);
-      if (near.comp >= 0) marks.push({ kind: "color", i: near.i, comp: near.comp, w: 4, role: c0 === 2 ? "S" : "E", outsideHint: near.out });
-    }
-    if (marks.length <= 2) out.push(...marks);   // 같은 색이 3곳 넘게 있으면 표시가 아니라 무늬예요
+  // 🏝️ 외톨이 색깔 점: 진짜 표시(화살표·점)는 둘레가 흰 종이와 검은 선뿐이에요.
+  // 그림 속 색 조각(강아지 목줄, 책 표지)은 둘레에 다른 색이 많아요.
+  const colorful = new Float32Array(w * h);
+  for (let p = 0; p < w * h; p++) {
+    const R = rgb[p * 4], G = rgb[p * 4 + 1], B = rgb[p * 4 + 2];
+    if (Math.max(R, G, B) - Math.min(R, G, B) >= 60) colorful[p] = 1;
   }
+  const cs = integral(colorful, w, h);
+  const lonely = b => {
+    const pad = Math.max(b.x1 - b.x0, b.y1 - b.y0) + 1;
+    const [all] = boxSum(cs, w, h, b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad), [own] = boxSum(cs, w, h, b.x0, b.y0, b.x1, b.y1);
+    return all - own <= b.n * 0.5;
+  };
+  // 미로에서 멀리 떨어진 색 조각(제목 그림 등)은 빼고 세요
+  const marks = { 1: [], 2: [] }, loose = [];
+  for (const c0 of [1, 2]) for (const b of blobs[c0]) {
+    const at = Math.min(rows - 1, Math.floor((b.y0 + b.y1) / 2 / h * rows)) * cols + Math.min(cols - 1, Math.floor((b.x0 + b.x1) / 2 / cell));
+    const near = nearestInside(at, cw * 4);
+    if (near.comp >= 0) marks[c0].push({ kind: "color", i: near.i, comp: near.comp, w: 4, role: c0 === 2 ? "S" : "E", outsideHint: near.out, lonely: lonely(b) });
+    if (near.comp < 0 || near.out) loose.push({ c0, b, cx: (b.x0 + b.x1) / 2, cy: (b.y0 + b.y1) / 2 });   // 미로 바깥 점 (안내문의 ● 같은 것)
+  }
+  let out = [];
+  if (total[1] <= w * h * 0.02 && total[2] <= w * h * 0.02) {
+    for (const c0 of [1, 2]) {
+      // 같은 색이 3곳 넘게 있으면 무늬예요. 단, 그중 외톨이 점만 세어 2곳 이하면 그걸 표시로 써요 (강아지 목줄 빼고 빨간 화살표 2개)
+      let m = marks[c0];
+      if (m.length > 2) m = m.filter(x => x.lonely);
+      if (m.length <= 2) out.push(...m);
+    }
+  } else {
+    // 미로 벽 자체가 빨강이나 초록이거나(색깔 미로) 컬러 그림이 많은 사진이면, 보통은 색깔 표시를 다 빼요.
+    // 단, 미로 안에 외톨이 색깔 점이 딱 2개 있고 서로 같은 미로 덩어리면 믿어요 (책 표지가 많은 공룡 미로)
+    const m = [...marks[1], ...marks[2]].filter(x => x.lonely && !x.outsideHint);
+    if (m.length === 2 && m[0].comp === m[1].comp) out = m;
+  }
+  // 미로 안 표시가 같은 색 2개뿐이면 색으로는 출발·도착을 못 가려요 → 이름표 없이 (위·왼쪽이 출발)
+  const inner = out.filter(x => !x.outsideHint);
+  if (inner.length === 2 && inner[0].role === inner[1].role) for (const x of inner) x.role = null;
+  // 📜 안내문 읽기: 미로 바깥에 작은 빨강·초록 점이 같은 줄에 나란히 있으면("● 공룡입에서 ● 공룡발까지") 왼쪽 점의 색이 출발이에요
+  const dots = loose.filter(d => d.b.n <= cwPx * cwPx && lonely(d.b));
+  const legend = dots.some(r => r.c0 === 1 && dots.some(g => g.c0 === 2 && Math.abs(r.cy - g.cy) <= cwPx && r.cx < g.cx && g.cx - r.cx < w * 0.4));
+  if (legend) for (const x of inner) if (x.role) x.role = x.role === "S" ? "E" : "S";   // 빨강 = 출발, 초록 = 도착
   return out;
 }
 
@@ -1128,6 +1293,43 @@ function findPictures() {
   return pics.length === 2 ? pics : [];
 }
 
+// 화살표가 가리키는 쪽(도착 화살표는 반대쪽)으로 한 칸씩 나아가다가, 양옆 벽 사이가 좁아지는 첫 칸 = 입구 틈
+// 거기서 길 폭 절반만큼 더 들어가서 틈 한가운데에 찍어요.
+// (가는 길에 테두리 선이 있어도 넘어가요. 입구가 연한 테두리 색에 가려 벽처럼 보일 때도 미로 안에 찍히게)
+function arrowEntry(a, carve = null) {
+  const L = Math.hypot(a.dx, a.dy), k = a.role === "S" ? 1 : -1, ux = k * a.dx / L, uy = k * a.dy / L;
+  const ax = a.at % cols, ay = (a.at / cols) | 0;
+  const at = (t, s = 0) => {   // 선 위 t번째 칸에서 옆으로 s칸
+    const x = Math.round(ax + ux * t - uy * s), y = Math.round(ay + uy * t + ux * s);
+    return x < 0 || y < 0 || x >= cols || y >= rows ? -1 : y * cols + x;
+  };
+  const cap = cw * 3;
+  const width = t => {          // 옆으로 양쪽 벽까지의 폭
+    let n = 1;
+    for (const sg of [1, -1]) for (let s = 1; s <= cap; s++) { const c = at(t, s * sg); if (c < 0 || rawWall[c]) break; n++; }
+    return n;
+  };
+  for (let t = 0; t <= cw * 15; t++) {
+    const i = at(t);
+    if (i < 0) break;
+    if (rawWall[i] || outsideCore[i] || width(t) > cw * 2) continue;
+    let e = i;
+    for (let s = 1; s <= cw * 0.5; s++) { const n = at(t + s); if (n < 0 || rawWall[n]) break; e = n; }
+    if (!carve) return e;
+    // 입구가 테두리 색에 가려 막혀 있으면, 같은 방향으로 미로 안쪽 길이 나올 때까지 작은 네모로 뚫어 줘요
+    const holes = [], hw = Math.max(1, Math.round(cw * 0.3));
+    for (let s = 0; s <= cw * 4; s++) {
+      const c = at(t + s);
+      if (c < 0) break;
+      if (s > 0 && !rawWall[c] && bigComp(comp[c])) { carve.push(...holes); break; }
+      const x = c % cols, y = (c / cols) | 0;
+      holes.push({ fx0: (x - hw) / cols, fy0: (y - hw) / rows, fx1: (x + hw + 1) / cols, fy1: (y + hw + 1) / rows });
+    }
+    return e;
+  }
+  return -1;
+}
+
 // 그 칸에서 가장 가까운 "미로 안쪽 길 칸" 찾기. 가장 가까운 길 칸이 바깥이면 out = true
 function nearestInside(at, maxD) {
   const x0 = at % cols, y0 = (at / cols) | 0;
@@ -1158,15 +1360,24 @@ function choosePair(cands) {
     if (best && !best.marked) { best.marked = true; best.w += 2; }
   }
   cands = cands.filter(c => !(c.kind === "color" && c.outsideHint));
-  // 입구 옆 바깥 글씨로 이름표 붙이기: E·F가 있으면(FINISH, END, EXIT) 도착, S만 있으면(START) 출발
+  // 입구 옆 바깥 글씨로 이름표 붙이기: 단어의 "첫 글자"로 봐요. S로 시작하면(START) 출발, F·E로 시작하면(FINISH, END, EXIT) 도착
+  // (Start의 t가 F처럼 보일 수 있어서, 글자가 섞여 있으면 맨 왼쪽 글자를 믿어요 — 어려운 미로17)
   const near = new Map();
   for (const t of cands.filter(c => c.kind === "hint")) {
     let best = null, bd = (cw * 10) ** 2;
     for (const g of gaps) { const d = dist2(g.i, t.i); if (d < bd) { bd = d; best = g; } }
-    if (best) { if (!near.has(best)) near.set(best, new Set()); near.get(best).add(t.ch); }
+    if (best) { if (!near.has(best)) near.set(best, []); near.get(best).push(t); }
   }
-  for (const [g, chs] of near) { g.role = chs.has("E") || chs.has("F") ? "E" : "S"; g.w = 3; }
+  for (const [g, ts] of near) {
+    // 입구에서 가장 가까운 글자와 같은 줄에 있는 글자들 = 한 단어 → 그중 맨 왼쪽 글자
+    const y = t => (t.i / cols) | 0, first = ts.reduce((a, b) => dist2(a.i, g.i) <= dist2(b.i, g.i) ? a : b);
+    const word = ts.filter(t => Math.abs(y(t) - y(first)) <= cw);
+    const lead = word.reduce((a, b) => a.i % cols <= b.i % cols ? a : b);
+    g.role = lead.ch === "S" ? "S" : "E"; g.w = 3; g.named = true;
+  }
   cands = cands.filter(c => c.kind !== "hint");
+  // 글씨로 이름이 붙은 입구 바로 옆의 색깔 덩어리는 표시가 아니라 그림이에요 (Start 옆 구급차, Finish 옆 병원의 십자)
+  cands = cands.filter(c => c.kind !== "color" || !gaps.some(g => g.named && dist2(g.i, c.i) < (cw * 8) ** 2));
   // 입구 바로 옆 글자(Finish의 F 같은 것)는 따로 찍지 않고, 그 입구에 이름표만 붙여요
   cands = cands.filter(c => {
     if (c.kind !== "letter") return true;
@@ -1193,6 +1404,12 @@ function choosePair(cands) {
     }
     return false;
   });
+  // 서로 이어진 입구가 딱 2곳이면, 짝 없이 혼자 있는 글자 하나는 E처럼 생긴 벽 조각이에요 (도넛 미로)
+  {
+    const lets = cands.filter(c => c.kind === "letter"), gs = cands.filter(c => c.kind === "gap");
+    if (lets.length === 1 && gs.length === 2 && gs[0].comp === gs[1].comp && gs[0].comp >= 0)
+      cands = cands.filter(c => c !== lets[0]);
+  }
   // 바깥 화살표가 출발(들어가는)·도착(나가는) 하나씩 있으면, 입구 대신 화살표 자리를 그대로 써요
   // (미국 미로처럼 두 입구가 바로 붙어 있으면 입구가 하나로 뭉쳐 보이거든요)
   const outArrows = cands.filter(c => c.kind === "arrow" && c.out && c.role);
@@ -1225,14 +1442,14 @@ function choosePair(cands) {
     // 사진 구석에 가장 가까운 길 칸 (끊겨 보이면 나중에 autoEnds가 진하기를 다듬어 이어 줘요)
     const a = nearestInside(0, Math.max(cols, rows)), b = nearestInside(cols * rows - 1, Math.max(cols, rows));
     if (a.comp < 0 || b.comp < 0) return [];
-    const s = a.i, g = b.i;
+    const s = toCorner(a.i, 0, 0), g = toCorner(b.i, cols - 1, rows - 1);
     return [{ s, g, sure: false, corner: true, why: "입구가 안 보여서 왼쪽 위 → 오른쪽 아래로 정했어요.", erase: [] }];
   }
   if (cands.length === 1) {
     // 후보가 하나뿐이면, 거기서 가장 멀리 갈 수 있는 칸을 짝으로
     const a = cands[0], far = farthest(a.i);
     const pair = a.role === "E" ? [far, a.i] : [a.i, far];
-    return [{ s: pair[0], g: pair[1], sure: false, why: "표시를 하나만 찾아서 가장 먼 곳을 짝으로 골랐어요.", erase: a.erase ? [a.erase] : [] }];
+    return [{ s: pair[0], g: pair[1], sure: false, why: "표시를 하나만 찾아서 가장 먼 곳을 짝으로 골랐어요.", erase: [].concat(a.erase || []) }];
   }
   const pairs = [];
   for (let p = 0; p < cands.length; p++) for (let q = p + 1; q < cands.length; q++) {
@@ -1268,7 +1485,7 @@ function finishPair(a, b, onlyTwoGaps) {
   const why = a.kind === b.kind ? `${name(a)} 2곳을 찾아서` : `${name(a)}와 ${name(b)}를 찾아서`;
   const strong = roled && a.kind !== "gap" && b.kind !== "gap";   // 글자·색깔로 S·E가 다 나온 짝
   const mouths = [a, b].filter(c => c.kind === "gap").map(c => ptOf(c.i));
-  return { s: a.i, g: b.i, sure, strong, far, why, erase: [a.erase, b.erase].filter(Boolean), mouths };
+  return { s: a.i, g: b.i, sure, strong, far, why, erase: [].concat(a.erase || [], b.erase || []), mouths };
 }
 const dist2 = (i, j) => (i % cols - j % cols) ** 2 + (((i / cols) | 0) - ((j / cols) | 0)) ** 2;
 
@@ -1304,6 +1521,28 @@ function nearestOfComp(c, X, Y) {
   for (let i = 0; i < comp.length; i++) if (ok ? ok.has(comp[i]) : comp[i] === c) {
     const d = (i % cols - X) ** 2 + (((i / cols) | 0) - Y) ** 2;
     if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+// 길을 따라(벽을 넘지 않고) 조금만 움직여서, 사진 구석 (X, Y)에 가장 가까운 칸으로 밀어 넣어요 (어려운 미로16)
+// 둘레 8칸이 다 길인 칸만 지나가요. 그래야 사진이 흐려서 생긴 1칸짜리 틈으로 미로 밖 모서리까지 새어 나가지 않아요
+function toCorner(s, X, Y) {
+  const R = cw * 3, sx0 = s % cols, sy0 = (s / cols) | 0, seen = new Set([s]), q = [s];
+  const roomy = i => {
+    const x = i % cols, y = (i / cols) | 0;
+    return DIR8.every(([dx, dy]) => { const nx = x + dx, ny = y + dy; return nx >= 0 && ny >= 0 && nx < cols && ny < rows && !wall[ny * cols + nx]; });
+  };
+  let best = s, bd = (sx0 - X) ** 2 + (sy0 - Y) ** 2;
+  for (let h = 0; h < q.length; h++) {
+    const c = q[h], x = c % cols, y = (c / cols) | 0;
+    const d = (x - X) ** 2 + (y - Y) ** 2;
+    if (d < bd) { bd = d; best = c; }
+    for (const [dx, dy] of DIR4) {
+      const nx = x + dx, ny = y + dy, ni = ny * cols + nx;
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows || Math.abs(nx - sx0) > R || Math.abs(ny - sy0) > R) continue;
+      if (!wall[ni] && roomy(ni) && !seen.has(ni)) { seen.add(ni); q.push(ni); }
+    }
   }
   return best;
 }
